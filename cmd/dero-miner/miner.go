@@ -398,6 +398,46 @@ func random_execution(wg *sync.WaitGroup, iterations int) {
 var connection *websocket.Conn
 var connection_mutex sync.Mutex
 
+// connectionEpoch counts successful (re)connects, bumped under
+// connection_mutex in the same critical section as the connection
+// assignment itself. mineblock's submit closures capture the epoch
+// alongside the job they're hashing against and re-check it immediately
+// before WriteJSON, inside connection_mutex -- if a reconnect happened in
+// between (found-hash to submit is not instantaneous), the job's JobID no
+// longer belongs to whatever session "connection" now points at, and the
+// server would silently reject it as stale. Closing that window is the
+// point of this counter: skip the doomed submission instead of sending it
+// into the void, and count it via staleSubmitsDropped so it's observable
+// rather than a silent share loss.
+var connectionEpoch uint64
+
+// staleSubmitsDropped counts shares mineblock declined to submit because
+// connectionEpoch moved between hashing the job and finishing the submit
+// -- i.e. a reconnect happened in the found-hash-to-submit window. Purely
+// observational (a non-zero count means the race is real on this host,
+// not that anything is broken -- the alternative was a submission the
+// server would have rejected anyway, just silently).
+var staleSubmitsDropped uint64
+
+// submitShare writes one share submission, unless connectionEpoch has
+// moved past epoch (the value mineblock captured when it fetched the job
+// this share is for) -- meaning a reconnect happened in the found-hash-
+// to-submit window, so jobID no longer belongs to whatever session
+// "connection" currently points at and the server would silently reject
+// it as stale. Checked inside connection_mutex, the same lock getwork
+// bumps connectionEpoch under, so there's no gap between the check and
+// the write for a concurrent reconnect to land in.
+func submitShare(epoch uint64, jobID, hashingBlob string) {
+	defer globals.Recover(1)
+	connection_mutex.Lock()
+	defer connection_mutex.Unlock()
+	if atomic.LoadUint64(&connectionEpoch) != epoch {
+		atomic.AddUint64(&staleSubmitsDropped, 1)
+		return
+	}
+	connection.WriteJSON(rpc.SubmitBlock_Params{JobID: jobID, MiniBlockhashing_blob: hashingBlob})
+}
+
 func getwork(wallet_address string) {
 	var err error
 
@@ -410,7 +450,16 @@ func getwork(wallet_address string) {
 		dialer.TLSClientConfig = &tls.Config{
 			InsecureSkipVerify: true,
 		}
+		// Locked (previously wasn't): connection is read-modify-write from
+		// mineblock's submit closures under connection_mutex, so assigning
+		// it here needs the same lock, not just the epoch bump below --
+		// otherwise this is a plain data race on top of the staleness one.
+		connection_mutex.Lock()
 		connection, _, err = websocket.DefaultDialer.Dial(u.String(), nil)
+		if err == nil {
+			atomic.AddUint64(&connectionEpoch, 1)
+		}
+		connection_mutex.Unlock()
 		if err != nil {
 			logger.Error(err, "Error connecting to server", "server adress", daemon_rpc_address)
 			logger.Info("Will try in 10 secs", "server adress", daemon_rpc_address)
@@ -475,6 +524,12 @@ func mineblock(tid int) {
 		myjob := job
 		local_job_counter = job_counter
 		mutex.RUnlock()
+		// Captured here, re-checked by submitShare right before each
+		// WriteJSON: local_job_counter == job_counter (the loop condition
+		// below) only guards against grinding on stale work, not against a
+		// reconnect landing in the narrow window between finding a valid
+		// hash and finishing its submission.
+		local_connection_epoch := atomic.LoadUint64(&connectionEpoch)
 
 		n, err := hex.Decode(work[:], []byte(myjob.Blockhashing_blob))
 		if err != nil || n != block.MINIBLOCK_SIZE {
@@ -506,13 +561,7 @@ func mineblock(tid int) {
 
 				if CheckPowHashBig(powhash, &diff) == true { // note we are doing a local, NW might have moved meanwhile
 					logger.V(1).Info("Successfully found DERO miniblock (going to submit)", "difficulty", myjob.Difficulty, "height", myjob.Height)
-					func() {
-						defer globals.Recover(1)
-						connection_mutex.Lock()
-						defer connection_mutex.Unlock()
-						connection.WriteJSON(rpc.SubmitBlock_Params{JobID: myjob.JobID, MiniBlockhashing_blob: fmt.Sprintf("%x", work[:])})
-					}()
-
+					submitShare(local_connection_epoch, myjob.JobID, fmt.Sprintf("%x", work[:]))
 				}
 			}
 		} else {
@@ -526,13 +575,7 @@ func mineblock(tid int) {
 
 				if CheckPowHashBig(powhash, &diff) == true { // note we are doing a local, NW might have moved meanwhile
 					logger.V(1).Info("Successfully found DERO miniblock (going to submit)", "difficulty", myjob.Difficulty, "height", myjob.Height)
-					func() {
-						defer globals.Recover(1)
-						connection_mutex.Lock()
-						defer connection_mutex.Unlock()
-						connection.WriteJSON(rpc.SubmitBlock_Params{JobID: myjob.JobID, MiniBlockhashing_blob: fmt.Sprintf("%x", work[:])})
-					}()
-
+					submitShare(local_connection_epoch, myjob.JobID, fmt.Sprintf("%x", work[:]))
 				}
 			}
 
