@@ -314,6 +314,7 @@ func main() {
 	}
 
 	go getwork(wallet_address)
+	go submitWorker()
 
 	for i := 0; i < threads; i++ {
 		go mineblock(i)
@@ -411,31 +412,67 @@ var connection_mutex sync.Mutex
 // rather than a silent share loss.
 var connectionEpoch uint64
 
-// staleSubmitsDropped counts shares mineblock declined to submit because
-// connectionEpoch moved between hashing the job and finishing the submit
+// staleSubmitsDropped counts shares submitWorker declined to submit
+// because connectionEpoch had moved past what the finding thread observed
 // -- i.e. a reconnect happened in the found-hash-to-submit window. Purely
 // observational (a non-zero count means the race is real on this host,
 // not that anything is broken -- the alternative was a submission the
 // server would have rejected anyway, just silently).
 var staleSubmitsDropped uint64
 
-// submitShare writes one share submission, unless connectionEpoch has
-// moved past epoch (the value mineblock captured when it fetched the job
-// this share is for) -- meaning a reconnect happened in the found-hash-
-// to-submit window, so jobID no longer belongs to whatever session
-// "connection" currently points at and the server would silently reject
-// it as stale. Checked inside connection_mutex, the same lock getwork
-// bumps connectionEpoch under, so there's no gap between the check and
-// the write for a concurrent reconnect to land in.
-func submitShare(epoch uint64, jobID, hashingBlob string) {
-	defer globals.Recover(1)
-	connection_mutex.Lock()
-	defer connection_mutex.Unlock()
-	if atomic.LoadUint64(&connectionEpoch) != epoch {
-		atomic.AddUint64(&staleSubmitsDropped, 1)
-		return
+// submitQueueOverflowed counts shares dropped because submitQueue was
+// full. Distinct from staleSubmitsDropped: this means the submitter
+// itself is stuck or badly behind (dead connection, network stall), not
+// just that one share's connection moved on since it was found. Should
+// stay at 0 in practice -- submitQueueSize is generous relative to how
+// often shares are actually found.
+var submitQueueOverflowed uint64
+
+// shareSubmission is one found share queued for submission. epoch is the
+// connectionEpoch value the finding thread observed when it started
+// hashing the job this share is for -- see connectionEpoch's comment.
+type shareSubmission struct {
+	epoch       uint64
+	jobID       string
+	hashingBlob string
+}
+
+const submitQueueSize = 64
+
+var submitQueue = make(chan shareSubmission, submitQueueSize)
+
+// enqueueShare hands a found share off to submitWorker and returns
+// immediately either way -- a mining thread that just found a share gets
+// straight back to hashing instead of blocking on connection_mutex and a
+// network write in its own hot loop. The non-blocking send means a full
+// queue (submitQueueOverflowed) drops the share rather than stalling the
+// hashing thread waiting for room.
+func enqueueShare(epoch uint64, jobID, hashingBlob string) {
+	select {
+	case submitQueue <- shareSubmission{epoch: epoch, jobID: jobID, hashingBlob: hashingBlob}:
+	default:
+		atomic.AddUint64(&submitQueueOverflowed, 1)
 	}
-	connection.WriteJSON(rpc.SubmitBlock_Params{JobID: jobID, MiniBlockhashing_blob: hashingBlob})
+}
+
+// submitWorker is the one goroutine that ever touches the network for
+// share submission -- started once from main(), runs for the process
+// lifetime. Keeping all submission I/O on a single goroutine, fed by
+// enqueueShare, is what lets mining threads hand off a found share and
+// move on instead of doing that I/O themselves.
+func submitWorker() {
+	for s := range submitQueue {
+		if atomic.LoadUint64(&connectionEpoch) != s.epoch {
+			atomic.AddUint64(&staleSubmitsDropped, 1)
+			continue
+		}
+		func() {
+			defer globals.Recover(1)
+			connection_mutex.Lock()
+			defer connection_mutex.Unlock()
+			connection.WriteJSON(rpc.SubmitBlock_Params{JobID: s.jobID, MiniBlockhashing_blob: s.hashingBlob})
+		}()
+	}
 }
 
 func getwork(wallet_address string) {
@@ -524,7 +561,7 @@ func mineblock(tid int) {
 		myjob := job
 		local_job_counter = job_counter
 		mutex.RUnlock()
-		// Captured here, re-checked by submitShare right before each
+		// Captured here, re-checked by submitWorker right before each
 		// WriteJSON: local_job_counter == job_counter (the loop condition
 		// below) only guards against grinding on stale work, not against a
 		// reconnect landing in the narrow window between finding a valid
@@ -561,7 +598,7 @@ func mineblock(tid int) {
 
 				if CheckPowHashBig(powhash, &diff) == true { // note we are doing a local, NW might have moved meanwhile
 					logger.V(1).Info("Successfully found DERO miniblock (going to submit)", "difficulty", myjob.Difficulty, "height", myjob.Height)
-					submitShare(local_connection_epoch, myjob.JobID, fmt.Sprintf("%x", work[:]))
+					enqueueShare(local_connection_epoch, myjob.JobID, fmt.Sprintf("%x", work[:]))
 				}
 			}
 		} else {
@@ -575,7 +612,7 @@ func mineblock(tid int) {
 
 				if CheckPowHashBig(powhash, &diff) == true { // note we are doing a local, NW might have moved meanwhile
 					logger.V(1).Info("Successfully found DERO miniblock (going to submit)", "difficulty", myjob.Difficulty, "height", myjob.Height)
-					submitShare(local_connection_epoch, myjob.JobID, fmt.Sprintf("%x", work[:]))
+					enqueueShare(local_connection_epoch, myjob.JobID, fmt.Sprintf("%x", work[:]))
 				}
 			}
 
