@@ -284,7 +284,7 @@ func main() {
 					testnet_string = "\033[31m TESTNET"
 				}
 
-				l.SetPrompt(fmt.Sprintf("\033[1m\033[32mDERO Miner: \033[0m"+color+"Height %d "+pcolor+" BLOCKS %d MiniBlocks %d Rejected %d \033[32mNW %s %s>%s>>\033[0m ", our_height, block_counter, mini_block_counter, rejected, hash_rate_string, mining_string, testnet_string))
+				l.SetPrompt(fmt.Sprintf("\033[1m\033[32mDERO Miner: \033[0m"+color+"Height %d "+pcolor+" BLOCKS %d MiniBlocks %d Rejected %d StaleSubmits %d \033[32mNW %s %s>%s>>\033[0m ", our_height, block_counter, mini_block_counter, rejected, atomic.LoadUint64(&staleSubmitsDropped), hash_rate_string, mining_string, testnet_string))
 				l.Refresh()
 				last_our_height = our_height
 				last_best_height = best_height
