@@ -632,10 +632,10 @@ func TestTemplateSAFallbackRate(t *testing.T) {
 	}
 }
 
-// TestTemplateSAZeroAllocsAfterWarmup: after one warmup call per fixture
-// (which lazily allocates scratch.templateSA, sa_template.go),
-// buildTemplateSA itself must be exactly 0 allocs/op, and no fallback may
-// occur during the measured run.
+// TestTemplateSAZeroAllocsAfterWarmup: after one warmup call (which lazily
+// allocates scratch.templateSA, sa_template.go), buildTemplateSA itself
+// must be exactly 0 allocs/op, and no fallback may occur during the
+// measured run.
 //
 // Scoped to buildTemplateSA directly (the SA-construction stage), not the
 // whole astroBWTv3 pipeline: a plain testing.AllocsPerRun around
@@ -644,34 +644,37 @@ func TestTemplateSAFallbackRate(t *testing.T) {
 // out of scope here. Only buildTemplateSA's own 0-alloc property matters,
 // matching BenchmarkTemplateSAStageOnly_Realistic's identical scope in
 // sa_template_bench_test.go.
-//
-// Uses real captured fixtures (loadSATemplateFixtures), not synthetic
-// uniform-random data shaped into artificial templates: uniform-random
-// bytes have none of real wolf-loop output's structural correlation, so
-// column-255 suffixes decorrelate far more than any real template does —
-// closer to Stage 4/5's theoretical worst case than to anything AstroBWTv3
-// actually produces (see stage5RunsCapacity/stage5MergeCapacity's
-// comments in sa_template.go, sized off the real 200k-hash measurement in
-// TestMeasureTemplateSAUsage). A synthetic non-representative payload
-// tripping the decline guard isn't evidence the guard is unsafe for real
-// traffic, just evidence uniform noise isn't real traffic — real fixtures
-// are the right bar for a "should never decline in practice" test.
 func TestTemplateSAZeroAllocsAfterWarmup(t *testing.T) {
-	fixtures := loadSATemplateFixtures(t)
+	rng := rand.New(rand.NewSource(20260803))
+	const dataLen = 66048 // 258 * 256, a realistic mid-range data_len
+	data := genUniformRandom(rng, dataLen)
+	data = append(data, 0, 0, 0, 0)
 
-	for _, f := range fixtures {
-		if !buildTemplateSA(f.scratch, f.dataLen) {
-			t.Fatalf("buildTemplateSA declined during warmup (dataLen=%d)", f.dataLen)
+	scratch := Pool.Get().(*ScratchData)
+	defer Pool.Put(scratch)
+	copy(scratch.data[:dataLen], data)
+	// A handful of evenly-sized templates covering the whole buffer.
+	const chunksPerTemplate = 6
+	fullChunks := uint32(dataLen) >> 8
+	templateIdx := 0
+	for start := uint32(0); start < fullChunks; start += chunksPerTemplate {
+		count := chunksPerTemplate
+		if start+chunksPerTemplate > fullChunks {
+			count = int(fullChunks - start)
 		}
-	} // warmup: lazily allocates each fixture's scratch.templateSA
+		scratch.markers[templateIdx] = uint16(start<<7 | uint32(count))
+		templateIdx++
+	}
+	scratch.nTemplates = uint32(templateIdx)
+
+	if !buildTemplateSA(scratch, dataLen) {
+		t.Fatalf("buildTemplateSA declined during warmup")
+	} // warmup: lazily allocates scratch.templateSA
 
 	before := templateSAFallbacks.Load()
-	i := 0
 	allocs := testing.AllocsPerRun(100, func() {
-		f := fixtures[i%len(fixtures)]
-		i++
-		if !buildTemplateSA(f.scratch, f.dataLen) {
-			t.Fatalf("buildTemplateSA declined during the measured run (dataLen=%d)", f.dataLen)
+		if !buildTemplateSA(scratch, dataLen) {
+			t.Fatalf("buildTemplateSA declined during the measured run")
 		}
 	})
 	after := templateSAFallbacks.Load()

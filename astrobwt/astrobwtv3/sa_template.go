@@ -73,38 +73,6 @@ const (
 	// slop, not a tight derivation.
 	stage4MaxGroupRun = 280
 	stage4ShortRunMax = 25
-
-	// stage5RunsCapacity bounds templateSAScratch.runs/radixTmp. Unlike
-	// arena (which really does need close to MAX_LENGTH -- see above),
-	// runs' theoretical worst case (every column of every group forming a
-	// singleton key, ~256*totalGroups ~= MAX_LENGTH) is far above what real
-	// AstroBWTv3 output produces: measured across 200,000 random
-	// MINIBLOCK-sized inputs plus every real captured fixture
-	// (TestMeasureTemplateSAUsage), len(runs) peaked at 28,358 (p99.99 was
-	// 27,097) -- consistent with this package's own ~87%-of-groups-are-
-	// structured finding (study.md) meaning most columns collapse into a
-	// handful of arena-run records, not one singleton per column. 49,152
-	// (exactly half of MAX_LENGTH) keeps ~1.7x margin over the observed
-	// max while still roughly halving this buffer's footprint. If a hash
-	// ever does exceed it, writeFusedRunsToSA declines cleanly to the
-	// divsufsort fallback (same shape as every other decline in this
-	// file) rather than growing or panicking -- correctness never depends
-	// on this constant being large enough, only performance does.
-	stage5RunsCapacity = MAX_LENGTH / 2
-
-	// stage5MergeCapacity bounds templateSAScratch.groupPos/mergePos/
-	// runLens/nextLens -- scratch for the k-way-merge fallback in
-	// writeFusedRunsToSA, reached only when one Stage-5 equal-key group is
-	// neither a single run, an all-literal group of <=32, nor exactly two
-	// runs. Measured across the same 200,064-hash run: this path fired
-	// 1,923,184 times (most hashes have several small equal-key
-	// collisions) but the largest single group ever expanded was 924
-	// positions -- nowhere near MAX_LENGTH. 4,096 keeps a >4x margin over
-	// that observed max at roughly 1/24th the memory. Same decline
-	// contract as stage5RunsCapacity: writeFusedRunsToSA checks before
-	// calling mergeEqualKeyRuns and falls back rather than risking an
-	// out-of-bounds slice.
-	stage5MergeCapacity = 4096
 )
 
 // templateSAFallbacks counts hashes where the descriptor SA declined and
@@ -112,15 +80,6 @@ const (
 // unaffected either way). Unexported: nothing outside this package needs
 // the process-wide count.
 var templateSAFallbacks atomic.Uint64
-
-// templateSAKWayMergeHits counts Stage-5 equal-key groups that needed the
-// rare k-way-merge path in writeFusedRunsToSA (groupPos/mergePos/runLens/
-// nextLens), i.e. neither a single run, an all-literal group of <=32, nor
-// exactly two runs. Observability only, same convention as
-// templateSAFallbacks -- lets buffer-sizing decisions for those four
-// buffers be based on how often this path is actually reachable in
-// practice, not just its theoretical worst case.
-var templateSAKWayMergeHits atomic.Uint64
 
 // stage5Run mirrors the reference's 8-byte descriptor record. key is the
 // native little-endian 24-bit load. packed: count<<17 | arenaBegin, or a
@@ -159,12 +118,12 @@ func newTemplateSAScratch() *templateSAScratch {
 	return &templateSAScratch{
 		order:    make([]uint32, 0, stage4MaxGroupRun),
 		arena:    make([]uint32, 0, templateArenaCapacity),
-		runs:     make([]stage5Run, 0, stage5RunsCapacity),
-		radixTmp: make([]stage5Run, stage5RunsCapacity),
-		groupPos: make([]uint32, 0, stage5MergeCapacity),
-		mergePos: make([]uint32, stage5MergeCapacity),
-		runLens:  make([]uint32, 0, stage5MergeCapacity),
-		nextLens: make([]uint32, 0, stage5MergeCapacity),
+		runs:     make([]stage5Run, 0, MAX_LENGTH),
+		radixTmp: make([]stage5Run, MAX_LENGTH),
+		groupPos: make([]uint32, 0, MAX_LENGTH),
+		mergePos: make([]uint32, MAX_LENGTH),
+		runLens:  make([]uint32, 0, MAX_LENGTH),
+		nextLens: make([]uint32, 0, MAX_LENGTH),
 	}
 }
 
