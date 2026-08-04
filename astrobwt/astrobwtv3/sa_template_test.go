@@ -444,26 +444,26 @@ func TestWolfLoopMarkersStructurallyConsistent(t *testing.T) {
 
 // ---- Production dispatch: differential and fixture round-trip ----
 
-// TestTemplateSADispatchMatchesProductionKAT checks the template-descriptor
-// path, opted into explicitly via scratch.useTemplateSA = true, against
-// AstroBWTv3's real production output (the divsufsort path, at this point)
-// on this package's own existing KAT inputs (pow_test.go's
-// random_pow_tests) — not the hardcoded hex vectors, which TestAstroBWTv3
-// already covers; this test's job is differential between the two SA
-// algorithms specifically.
+// TestTemplateSADispatchMatchesProductionKAT checks AstroBWTv3's real
+// production output (the template path by default, see sa_fast.go's
+// Pool.New) against the divsufsort path, forced explicitly via
+// scratch.useTemplateSA = false, on this package's own existing KAT inputs
+// (pow_test.go's random_pow_tests) — not the hardcoded hex vectors, which
+// TestAstroBWTv3 already covers; this test's job is differential between
+// the two SA algorithms specifically.
 func TestTemplateSADispatchMatchesProductionKAT(t *testing.T) {
 	for i := range random_pow_tests {
 		in := []byte(random_pow_tests[i].in)
 
-		templateScratch := Pool.Get().(*ScratchData)
-		templateScratch.useTemplateSA = true
-		got := astroBWTv3(in, templateScratch)
-		Pool.Put(templateScratch)
+		refScratch := Pool.Get().(*ScratchData)
+		refScratch.useTemplateSA = false
+		want := astroBWTv3(in, refScratch)
+		Pool.Put(refScratch)
 
-		want := AstroBWTv3(in) // production = divsufsort, at this point
+		got := AstroBWTv3(in) // production = template path by default
 
 		if got != want {
-			t.Fatalf("input %q: template path = %x, want (production/divsufsort) %x", in, got, want)
+			t.Fatalf("input %q: production (template) = %x, want (divsufsort reference) %x", in, got, want)
 		}
 	}
 }
@@ -482,10 +482,9 @@ const saTemplateFixtureDirForTest = "testdata/safixtures_template"
 // package's own divsufsort oracle on the same data — the primary
 // correctness check, self-contained and not dependent on re-running
 // anything; (2) a fresh, fully re-run wolf loop over the fixture's
-// original 48-byte seed input agrees between the template path (opted
-// into explicitly) and production (the divsufsort path, at this point) —
-// proving the captured markers are faithful to a real run, not just
-// internally self-consistent.
+// original 48-byte seed input agrees between production (template path)
+// and the divsufsort reference — proving the captured markers are
+// faithful to a real run, not just internally self-consistent.
 func TestTemplateSAFixtureRoundTrip(t *testing.T) {
 	entries, err := os.ReadDir(saTemplateFixtureDirForTest)
 	if err != nil {
@@ -545,16 +544,17 @@ func TestTemplateSAFixtureRoundTrip(t *testing.T) {
 		Pool.Put(scratch)
 
 		// (2) a fully fresh run (real wolf loop, not replayed bytes) of the
-		// original seed agrees between the template path and production —
-		// complements (1), which only replays already-captured data/markers.
-		templateScratch := Pool.Get().(*ScratchData)
-		templateScratch.useTemplateSA = true
-		gotHash := astroBWTv3(inputRaw, templateScratch)
-		Pool.Put(templateScratch)
+		// original seed agrees between production (template path) and the
+		// divsufsort reference — complements (1), which only replays
+		// already-captured data/markers.
+		refScratch := Pool.Get().(*ScratchData)
+		refScratch.useTemplateSA = false
+		wantHash := astroBWTv3(inputRaw, refScratch)
+		Pool.Put(refScratch)
 
-		wantHash := AstroBWTv3(inputRaw) // production = divsufsort, at this point
+		gotHash := AstroBWTv3(inputRaw) // production = template path by default
 		if gotHash != wantHash {
-			t.Fatalf("fixture %s: fresh template-path run != production (divsufsort)", name)
+			t.Fatalf("fixture %s: fresh production (template) run != divsufsort reference", name)
 		}
 
 		count++
@@ -566,26 +566,26 @@ func TestTemplateSAFixtureRoundTrip(t *testing.T) {
 }
 
 // TestTemplateSADifferentialVsProduction runs many random 48-byte (real
-// protocol input size) hashes through the template path, opted into
-// explicitly via scratch.useTemplateSA = true, and checks byte-for-byte
-// agreement with AstroBWTv3's real production output (the divsufsort
-// path, at this point).
+// protocol input size) hashes through AstroBWTv3 (template path by
+// default, sa_fast.go's Pool.New) and checks byte-for-byte agreement with
+// the divsufsort reference path, forced explicitly via
+// scratch.useTemplateSA = false.
 func TestTemplateSADifferentialVsProduction(t *testing.T) {
 	n := 5000
 	if testing.Short() {
 		n = 300
 	}
 	rng := rand.New(rand.NewSource(20260803))
-	templateScratch := Pool.Get().(*ScratchData)
-	templateScratch.useTemplateSA = true
-	defer Pool.Put(templateScratch)
+	refScratch := Pool.Get().(*ScratchData)
+	refScratch.useTemplateSA = false
+	defer Pool.Put(refScratch)
 
 	for i := 0; i < n; i++ {
 		input := genUniformRandom(rng, 48)
-		got := astroBWTv3(input, templateScratch)
-		want := AstroBWTv3(input) // production = divsufsort, at this point
+		want := astroBWTv3(input, refScratch)
+		got := AstroBWTv3(input) // production = template path by default
 		if got != want {
-			t.Fatalf("trial %d: input %x: template path = %x, want (production/divsufsort) %x", i, input, got, want)
+			t.Fatalf("trial %d: input %x: production (template) = %x, want (divsufsort reference) %x", i, input, got, want)
 		}
 	}
 }
@@ -596,16 +596,16 @@ func TestTemplateSADifferentialVsProduction(t *testing.T) {
 func TestTemplateSADifferentialLengths(t *testing.T) {
 	lengths := []int{1, 2, 3, 7, 16, 31, 47, 48, 49, 64, 255, 1024}
 	rng := rand.New(rand.NewSource(20260803))
-	templateScratch := Pool.Get().(*ScratchData)
-	templateScratch.useTemplateSA = true
-	defer Pool.Put(templateScratch)
+	refScratch := Pool.Get().(*ScratchData)
+	refScratch.useTemplateSA = false
+	defer Pool.Put(refScratch)
 
 	for _, n := range lengths {
 		input := genUniformRandom(rng, n)
-		got := astroBWTv3(input, templateScratch)
-		want := AstroBWTv3(input) // production = divsufsort, at this point
+		want := astroBWTv3(input, refScratch)
+		got := AstroBWTv3(input) // production = template path by default
 		if got != want {
-			t.Fatalf("length %d: template path = %x, want (production/divsufsort) %x", n, got, want)
+			t.Fatalf("length %d: production (template) = %x, want (divsufsort reference) %x", n, got, want)
 		}
 	}
 }

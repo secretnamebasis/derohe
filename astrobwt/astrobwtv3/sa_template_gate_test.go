@@ -44,21 +44,21 @@ func TestTemplateSAMillionHashGate(t *testing.T) {
 		go func(seed int64) {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(seed))
-			templateScratch := Pool.Get().(*ScratchData)
-			templateScratch.useTemplateSA = true
-			defer Pool.Put(templateScratch)
+			refScratch := Pool.Get().(*ScratchData)
+			refScratch.useTemplateSA = false
+			defer Pool.Put(refScratch)
 
 			for i := 0; i < perWorker; i++ {
 				if failed.Load() {
 					return
 				}
 				input := genUniformRandom(rng, 48)
-				got := astroBWTv3(input, templateScratch)
-				want := AstroBWTv3(input) // production = divsufsort, at this point
+				want := astroBWTv3(input, refScratch)
+				got := AstroBWTv3(input) // production = template path by default
 				checked.Add(1)
 				if got != want {
 					once.Do(func() {
-						t.Errorf("mismatch on worker seed=%d after %d hashes: input=%x template=%x production_divsufsort=%x", seed, i, input, got, want)
+						t.Errorf("mismatch on worker seed=%d after %d hashes: input=%x production(template)=%x divsufsort_ref=%x", seed, i, input, got, want)
 					})
 					failed.Store(true)
 					return

@@ -28,14 +28,12 @@ package astrobwtv3
 // NOT to text_32_0alloc_sais, since divsufsort is already faster than SAIS,
 // unlike the upstream reference (whose fallback is SAIS).
 //
-// Opt-in, not yet the default: nothing reaches this code unless a caller
-// explicitly sets ScratchData.useTemplateSA = true on a scratch it owns
-// directly (see astroBWTv3(input, scratch) in pow.go, which takes an
-// explicit scratch). AstroBWTv3's own behavior is unchanged — every
-// pool-provided ScratchData has useTemplateSA == false by default (Go zero
-// value). This package's own differential tests compare this path against
-// AstroBWTv3's real output (the divsufsort path, at this point) to prove it
-// byte-identical before it becomes the default.
+// This is the production SA-construction path: Pool.New (sa_fast.go) sets
+// ScratchData.useTemplateSA = true for every pooled scratch, so AstroBWTv3
+// itself runs this code by default. Force scratch.useTemplateSA = false (via
+// astroBWTv3(input, scratch) in pow.go, which takes an explicit scratch) to
+// get the divsufsort path instead — this package's own differential tests
+// use that as the independent reference to check this path against.
 //
 // Buffer sizing diverges from the upstream reference in two constants,
 // because this package's own MAX_LENGTH (98303, sa_fast.go) is looser than

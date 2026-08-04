@@ -39,11 +39,9 @@ func AstroBWTv3(input []byte) (outputhash [32]byte) {
 
 // astroBWTv3 is AstroBWTv3's body, taking scratch as an explicit parameter
 // instead of pulling one from Pool internally. This gives callers a seam to
-// opt a specific, caller-owned scratch into the template-descriptor SA path
-// (scratch.useTemplateSA = true) without changing AstroBWTv3's exported
-// signature or behavior — AstroBWTv3 itself always passes a fresh
-// Pool.Get() scratch, whose useTemplateSA is the Go zero value (false), so
-// this extraction alone changes nothing observable.
+// force scratch.useTemplateSA = false (the divsufsort path) explicitly —
+// used by this package's own differential tests, since AstroBWTv3 itself
+// runs the template path by default (Pool.New sets useTemplateSA = true).
 func astroBWTv3(input []byte, scratch *ScratchData) (outputhash [32]byte) {
 
 	//var static_key = [32]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32}
@@ -2480,7 +2478,10 @@ func astroBWTv3(input []byte, scratch *ScratchData) (outputhash [32]byte) {
 	} else if !buildTemplateSA(scratch, data_len) {
 		// Decline falls back to this package's own production divsufsort
 		// path (text_32_0alloc) — deliberately not SAIS, since divsufsort is
-		// already faster than SAIS (see sa_template.go's header).
+		// already faster than SAIS (see sa_template.go's header). The
+		// template path is the default (Pool.New sets useTemplateSA = true),
+		// so this is the real, live fallback for any hash it declines, not a
+		// dead branch.
 		templateSAFallbacks.Add(1)
 		text_32_0alloc(scratch.data[:data_len], scratch.sa[:data_len])
 	}
