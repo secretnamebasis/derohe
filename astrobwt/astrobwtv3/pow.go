@@ -43,14 +43,81 @@ func AstroBWTv3(input []byte) (outputhash [32]byte) {
 // used by this package's own differential tests, since AstroBWTv3 itself
 // runs the template path by default (Pool.New sets useTemplateSA = true).
 func astroBWTv3(input []byte, scratch *ScratchData) (outputhash [32]byte) {
+	data_len := astroBWTv3Stream(input, scratch)
+	if data_len == 0 {
+		// astroBWTv3Stream panicked and recovered; preserve the original
+		// behavior (return a random falsified hash which will fail the
+		// check, rather than propagate the panic and crash the miner).
+		var buf [16]byte
+		rand.Read(buf[:])
+		return sha256.Sum256(buf[:])
+	}
+
+	if LittleEndian {
+		scratch.hasher.Reset()
+		scratch.hasher.Write(scratch.sa_bytes[:data_len*4])
+	} else {
+		var s [MAX_LENGTH * 4]byte
+		for i, c := range scratch.sa[:data_len] {
+			binary.LittleEndian.PutUint32(s[i<<1:], uint32(c))
+		}
+		scratch.hasher.Reset()
+		scratch.hasher.Write(s[:data_len*4])
+	}
+
+	_ = scratch.hasher.Sum(outputhash[:0])
+	return outputhash
+}
+
+// AstroBWTv3Pair hashes two independent inputs, running their final SHA-256
+// through the 2-way SHA-NI kernel (sha256mb_amd64.go) when available,
+// falling back to two ordinary hashes otherwise -- see pairHashAvailable.
+// Byte-identical to (AstroBWTv3(a), AstroBWTv3(b)) on every host, by
+// construction: both the pairHashAvailable()==false branch and the rare
+// mid-stream-panic branch call AstroBWTv3 directly, the exact same function
+// any single-hash caller uses, rather than a separately maintained slow
+// path that could drift from it.
+func AstroBWTv3Pair(a, b []byte) (ha, hb [32]byte) {
+	if !pairHashAvailable() {
+		return AstroBWTv3(a), AstroBWTv3(b)
+	}
+
+	scratchA := Pool.Get().(*ScratchData)
+	defer Pool.Put(scratchA)
+	scratchB := Pool.Get().(*ScratchData)
+	defer Pool.Put(scratchB)
+
+	la := astroBWTv3Stream(a, scratchA)
+	lb := astroBWTv3Stream(b, scratchB)
+	if la == 0 || lb == 0 {
+		// Rare: astroBWTv3Stream panicked and recovered on at least one
+		// side. Rather than salvage a partial pair, fall back to two
+		// independent, already-safe single hashes -- each gets its own
+		// fresh scratch and its own Stream call/recover via AstroBWTv3.
+		return AstroBWTv3(a), AstroBWTv3(b)
+	}
+
+	return sha256Sum256Pair(scratchA.sa_bytes[:la*4], scratchB.sa_bytes[:lb*4])
+}
+
+// astroBWTv3Stream runs every stage up to and including suffix-array
+// construction: after it returns, scratch.sa[:data_len] holds the SA whose
+// little-endian bytes are the final SHA-256 input. Split out of astroBWTv3
+// so AstroBWTv3Pair can batch two nonces' final hashes through the 2-way
+// SHA-NI path. Has its own panic recover, since it's now called from two
+// places (astroBWTv3 and AstroBWTv3Pair) instead of one -- same reasoning
+// as the original, undivided function's recover ("if something happens due
+// to RAM issues in miner, we should continue, avoiding crashes if
+// possible"). data_len == 0 on return is an unambiguous panic signal to the
+// caller: the wolf loop's own minimum (261 tries) guarantees
+// data_len >= 65792 on any real, non-panicking run.
+func astroBWTv3Stream(input []byte, scratch *ScratchData) (data_len uint32) {
 
 	//var static_key = [32]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32}
 
 	defer func() {
-		if r := recover(); r != nil { // if something happens due to RAM issues in miner, we should continue, avoiding crashes if possible
-			var buf [16]byte
-			rand.Read(buf[:])
-			outputhash = sha256.Sum256(buf[:]) // return a random falsified hash which will fail the check
+		if recover() != nil { // if something happens due to RAM issues in miner, we should continue, avoiding crashes if possible
+			data_len = 0
 		}
 	}()
 
@@ -2469,7 +2536,7 @@ func astroBWTv3(input []byte, scratch *ScratchData) (outputhash [32]byte) {
 	scratch.nTemplates = uint32(templateIdx + 1)
 
 	// we may discard upto ~ 1KiB data from the stream
-	data_len := uint32((tries-4)*256 + (uint64(step_3[253])<<8|uint64(step_3[254]))&0x3ff) // ensure wide  number of variants exists
+	data_len = uint32((tries-4)*256 + (uint64(step_3[253])<<8|uint64(step_3[254]))&0x3ff) // ensure wide  number of variants exists
 
 	maybeCaptureScratch(scratch.data[:data_len], data_len)
 	maybeCaptureScratchTemplate(scratch.data[:data_len], data_len, scratch.markers[:], scratch.nTemplates)
@@ -2486,19 +2553,5 @@ func astroBWTv3(input []byte, scratch *ScratchData) (outputhash [32]byte) {
 		text_32_0alloc(scratch.data[:data_len], scratch.sa[:data_len])
 	}
 
-	if LittleEndian {
-		scratch.hasher.Reset()
-		scratch.hasher.Write(scratch.sa_bytes[:data_len*4])
-	} else {
-		var s [MAX_LENGTH * 4]byte
-		for i, c := range scratch.sa[:data_len] {
-			binary.LittleEndian.PutUint32(s[i<<1:], uint32(c))
-		}
-		scratch.hasher.Reset()
-		scratch.hasher.Write(s[:data_len*4])
-	}
-
-	_ = scratch.hasher.Sum(outputhash[:0])
-
-	return outputhash
+	return data_len
 }
