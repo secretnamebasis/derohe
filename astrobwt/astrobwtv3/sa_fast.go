@@ -14,14 +14,10 @@ const MAX_LENGTH uint32 = (256 * 384) - 1 // this is the maximum
 // this optimized algorithm is used only  in the miner and not in the blockchain
 
 type ScratchData struct {
-	hasher              hash.Hash
-	data                [MAX_LENGTH + 64]uint8
-	stage1_result       *[MAX_LENGTH + 1]uint16
-	stage1_result_bytes *[(MAX_LENGTH) * 2]uint8
-	indices             [MAX_LENGTH + 1]uint32 // 256 KB
-	tmp_indices         [MAX_LENGTH + 1]uint32 // 256 KB
-	sa                  [MAX_LENGTH]int32
-	sa_bytes            *[(MAX_LENGTH) * 4]uint8
+	hasher   hash.Hash
+	data     [MAX_LENGTH + 64]uint8
+	sa       [MAX_LENGTH]int32
+	sa_bytes *[(MAX_LENGTH) * 4]uint8
 
 	// Template-descriptor SA construction (sa_template.go): exploits the
 	// repeat structure AstroBWTv3's own wolf loop produces (see that file's
@@ -50,8 +46,6 @@ var Pool = sync.Pool{New: func() interface{} {
 	// explicitly — this package's own differential tests use that as the
 	// independent reference to check the template path against.
 	d.useTemplateSA = true
-	d.stage1_result = ((*[MAX_LENGTH + 1]uint16)(unsafe.Pointer(&d.indices[0])))
-	d.stage1_result_bytes = ((*[(MAX_LENGTH) * 2]byte)(unsafe.Pointer(&d.indices[0])))
 	d.sa_bytes = ((*[(MAX_LENGTH) * 4]byte)(unsafe.Pointer(&d.sa[0])))
 
 	return &d
@@ -86,16 +80,20 @@ func fix(v []byte, indices []uint32, i int) {
 }
 
 // basically
-func sort_indices(N uint32, v []byte, output []uint16, d *ScratchData) {
+//
+// indices/tmp_indices are caller-supplied scratch (each needs MAX_LENGTH+1
+// uint32 slots) rather than fields on ScratchData: this path is not used by
+// production AstroBWTv3 (see text_32_0alloc's doc comment for what is),
+// only by BenchmarkSortIndicesFastPath_Realistic for historical comparison,
+// so keeping its ~768KB of scratch out of the pooled per-worker struct that
+// every real mining thread carries was a straightforward win.
+func sort_indices(N uint32, v []byte, output []uint16, indices, tmp_indices []uint32) {
 
 	var byte_counters [2][256]uint16
 	var counters [2][256]uint16
 
 	v[N] = 0   // make sure extra byte accessed is zero
 	v[N+1] = 0 // make sure extra byte accessed is zero
-
-	indices := d.indices[:]
-	tmp_indices := d.tmp_indices[:]
 
 	for _, c := range v[:N] {
 		byte_counters[1][c]++
