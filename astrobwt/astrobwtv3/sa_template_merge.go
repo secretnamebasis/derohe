@@ -265,6 +265,15 @@ func mergeEqualKeyRuns(view *stage4View, v *templateSAScratch) {
 
 // writeFusedRunsToSA sorts the records and writes the final SA positions.
 func writeFusedRunsToSA(view *stage4View, v *templateSAScratch, sa []int32) bool {
+	// radixSortRunsByStoredKey indexes v.radixTmp directly up to len(v.runs)
+	// (not via append), so it can't grow itself the way v.runs can -- if a
+	// hash ever produces more runs than stage5RunsCapacity provisions for,
+	// decline to the divsufsort fallback instead of risking an
+	// out-of-bounds slice. See stage5RunsCapacity's comment for how rare
+	// this is expected to be in practice.
+	if len(v.runs) > cap(v.radixTmp) {
+		return false
+	}
 	radixSortRunsByStoredKey(v)
 
 	// uint32 view of sa: positions < 2^31, so int32/uint32 bits are identical
@@ -305,6 +314,7 @@ func writeFusedRunsToSA(view *stage4View, v *templateSAScratch, sa []int32) bool
 			if outPos, handled = tryWriteLiteralGroup(view, group, sa, outPos); !handled {
 				if outPos, handled = tryWriteTwoRuns(view, arena, group, sa, outPos); !handled {
 					// rare fallback: expand all positions and k-way merge
+					templateSAKWayMergeHits.Add(1)
 					v.groupPos = v.groupPos[:0]
 					v.runLens = v.runLens[:0]
 					for i := range group {
@@ -313,6 +323,14 @@ func writeFusedRunsToSA(view *stage4View, v *templateSAScratch, sa []int32) bool
 						for rel := uint32(0); rel < count; rel++ {
 							v.groupPos = append(v.groupPos, fusedRunPos(arena, group[i], rel))
 						}
+					}
+					// mergeEqualKeyRuns indexes v.mergePos directly up to
+					// len(v.groupPos) (not via append), so -- same reasoning
+					// as the radixTmp check above -- decline rather than risk
+					// an out-of-bounds slice if this one equal-key group's
+					// expanded position count ever exceeds stage5MergeCapacity.
+					if len(v.groupPos) > cap(v.mergePos) {
+						return false
 					}
 					mergeEqualKeyRuns(view, v)
 					if outPos+len(v.groupPos) > len(saU32) {
