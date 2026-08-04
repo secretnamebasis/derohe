@@ -26,6 +26,12 @@ var __ = rand.Read
 const CALCULATE_DISTRIBUTION = false
 const REFERENCE_MODE = true
 
+// forceScalarBranchOp bypasses the opClass/opLUT fast paths, routing every op
+// through applyBranchOp (the verbatim reference switch) unconditionally.
+// False in production; tests flip it to differential-test the fast paths
+// against the reference they were derived from, on real end-to-end hashes.
+var forceScalarBranchOp = false
+
 var ops [256]int
 var steps = map[uint64]int{}
 
@@ -175,7 +181,28 @@ func astroBWTv3Stream(input []byte, scratch *ScratchData) (data_len uint32) {
 
 		_ = step_3[pos1:pos2] // bounds check elimination
 
-		lhash, prev_lhash, rc4s = applyBranchOp(op, pos1, pos2, step_3[:], lhash, prev_lhash, rc4s)
+		// opClass/opLUT (branch_op_lut.go) cover the majority of the 256 ops
+		// with a plain load-then-store, self-derived and verified bit-identical
+		// to applyBranchOp (see branch_op_lut_gen_test.go / branch_op_lut_test.go).
+		// Everything else -- pos2-dependent ops, op 0's cross-iteration swap, and
+		// the mandatory side effects on ops 253/254/255 -- still goes through the
+		// untouched reference switch. forceScalarBranchOp lets tests bypass the
+		// fast paths entirely for a direct differential comparison.
+		switch {
+		case forceScalarBranchOp:
+			lhash, prev_lhash, rc4s = applyBranchOp(op, pos1, pos2, step_3[:], lhash, prev_lhash, rc4s)
+		case opClass[op] == opClassZero:
+			for i := pos1; i < pos2; i++ {
+				step_3[i] = 0
+			}
+		case opClass[op] == opClassLUT:
+			lut := &opLUT[op]
+			for i := pos1; i < pos2; i++ {
+				step_3[i] = lut[step_3[i]]
+			}
+		default:
+			lhash, prev_lhash, rc4s = applyBranchOp(op, pos1, pos2, step_3[:], lhash, prev_lhash, rc4s)
+		}
 
 		if step_3[pos1]-step_3[pos2] < 0x10 { // 6.25 % probability
 			prev_lhash = lhash + prev_lhash
