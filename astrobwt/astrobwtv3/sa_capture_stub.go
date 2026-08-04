@@ -8,3 +8,7 @@ package astrobwtv3
 // realistic ~64-70KB benchmark/oracle fixtures from actual AstroBWTv3 runs.
 // See sa_capture_hook.go.
 func maybeCaptureScratch(data []byte, dataLen uint32) {}
+
+// maybeCaptureScratchTemplate is maybeCaptureScratch's sibling stub; see
+// sa_capture_hook.go's ScratchCaptureTemplateHook.
+func maybeCaptureScratchTemplate(data []byte, dataLen uint32, markers []uint16, nTemplates uint32) {}

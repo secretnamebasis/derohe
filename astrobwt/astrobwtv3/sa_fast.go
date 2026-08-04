@@ -22,6 +22,20 @@ type ScratchData struct {
 	tmp_indices         [MAX_LENGTH + 1]uint32 // 256 KB
 	sa                  [MAX_LENGTH]int32
 	sa_bytes            *[(MAX_LENGTH) * 4]uint8
+
+	// Template-descriptor SA construction (sa_template.go): exploits the
+	// repeat structure AstroBWTv3's own wolf loop produces (see that file's
+	// header), rather than treating scratch.data as opaque text the way
+	// divsufsort/SA-IS do. markers/nTemplates/flags are populated
+	// unconditionally by pow.go's wolf loop regardless of useTemplateSA,
+	// since recording them is pure bookkeeping with no effect on the hash —
+	// see sa_template.go's header for why that's safe. Off by default (Go
+	// zero value); force useTemplateSA = true on a scratch to opt in.
+	markers       [280]uint16 // template markers: firstChunk<<7 | chunkCount
+	nTemplates    uint32
+	flags         [280]byte          // stage-5 group-boundary flags (buildStage5Flags output)
+	useTemplateSA bool               // opt-in switch; off by default
+	templateSA    *templateSAScratch // lazily allocated on first use
 }
 
 var Pool = sync.Pool{New: func() interface{} {

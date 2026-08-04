@@ -32,11 +32,21 @@ var steps = map[uint64]int{}
 
 // this will generate a hash
 func AstroBWTv3(input []byte) (outputhash [32]byte) {
-
-	//var static_key = [32]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32}
-
 	scratch := Pool.Get().(*ScratchData)
 	defer Pool.Put(scratch)
+	return astroBWTv3(input, scratch)
+}
+
+// astroBWTv3 is AstroBWTv3's body, taking scratch as an explicit parameter
+// instead of pulling one from Pool internally. This gives callers a seam to
+// opt a specific, caller-owned scratch into the template-descriptor SA path
+// (scratch.useTemplateSA = true) without changing AstroBWTv3's exported
+// signature or behavior — AstroBWTv3 itself always passes a fresh
+// Pool.Get() scratch, whose useTemplateSA is the Go zero value (false), so
+// this extraction alone changes nothing observable.
+func astroBWTv3(input []byte, scratch *ScratchData) (outputhash [32]byte) {
+
+	//var static_key = [32]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32}
 
 	defer func() {
 		if r := recover(); r != nil { // if something happens due to RAM issues in miner, we should continue, avoiding crashes if possible
@@ -65,6 +75,13 @@ func AstroBWTv3(input []byte) (outputhash [32]byte) {
 	prev_lhash := lhash // this is used to to randomly switch patterns
 
 	tries := uint64(0)
+	// Template-marker bookkeeping for sa_template.go: recorded unconditionally
+	// (pure integer arithmetic on values already live below, no effect on
+	// step_3/data/data_len/the final hash) so scratch.markers/nTemplates are
+	// always populated. See sa_template.go's header.
+	templateIdx := 0
+	chunkCount := uint32(1)
+	firstChunk := uint32(0)
 	// the below for loop is branchy, TODO make it more branchy to avoid GPU/FPGA optimizations
 	for { // keep the looop running n number of times,  n >= 1
 		tries++
@@ -2421,6 +2438,18 @@ func AstroBWTv3(input []byte) (outputhash [32]byte) {
 
 		if step_3[pos1]-step_3[pos2] <= 0x40 { // 25% probablility
 			rc4s.XORKeyStream(step_3[:], step_3[:]) // do the rc4
+
+			// Close the template run that just ended and open a new one. See
+			// sa_template.go's header for why this is safe to record
+			// unconditionally.
+			scratch.markers[templateIdx] = uint16(firstChunk<<7 | chunkCount)
+			if tries > 1 {
+				templateIdx++
+			}
+			firstChunk = uint32(tries) - 1
+			chunkCount = 1
+		} else {
+			chunkCount++
 		}
 
 		step_3[255] = step_3[255] ^ step_3[pos1] ^ step_3[pos2]
@@ -2437,11 +2466,24 @@ func AstroBWTv3(input []byte) (outputhash [32]byte) {
 		steps[tries]++
 	}
 
+	// Flush the final (unflushed) template.
+	scratch.markers[templateIdx] = uint16(firstChunk<<7 | chunkCount)
+	scratch.nTemplates = uint32(templateIdx + 1)
+
 	// we may discard upto ~ 1KiB data from the stream
 	data_len := uint32((tries-4)*256 + (uint64(step_3[253])<<8|uint64(step_3[254]))&0x3ff) // ensure wide  number of variants exists
 
 	maybeCaptureScratch(scratch.data[:data_len], data_len)
-	text_32_0alloc(scratch.data[:data_len], scratch.sa[:data_len])
+	maybeCaptureScratchTemplate(scratch.data[:data_len], data_len, scratch.markers[:], scratch.nTemplates)
+	if !scratch.useTemplateSA {
+		text_32_0alloc(scratch.data[:data_len], scratch.sa[:data_len])
+	} else if !buildTemplateSA(scratch, data_len) {
+		// Decline falls back to this package's own production divsufsort
+		// path (text_32_0alloc) — deliberately not SAIS, since divsufsort is
+		// already faster than SAIS (see sa_template.go's header).
+		templateSAFallbacks.Add(1)
+		text_32_0alloc(scratch.data[:data_len], scratch.sa[:data_len])
+	}
 
 	if LittleEndian {
 		scratch.hasher.Reset()
