@@ -184,10 +184,12 @@ func astroBWTv3Stream(input []byte, scratch *ScratchData) (data_len uint32) {
 		// opClass/opLUT (branch_op_lut.go) cover the majority of the 256 ops
 		// with a plain load-then-store, self-derived and verified bit-identical
 		// to applyBranchOp (see branch_op_lut_gen_test.go / branch_op_lut_test.go).
-		// Everything else -- pos2-dependent ops, op 0's cross-iteration swap, and
-		// the mandatory side effects on ops 253/254/255 -- still goes through the
-		// untouched reference switch. forceScalarBranchOp lets tests bypass the
-		// fast paths entirely for a direct differential comparison.
+		// tryWolfPermuteAVX2 covers the pos2-dependent remainder via a vectorized
+		// kernel (branch_op_avx2_kernel_amd64.s) when available, declining safely
+		// (see its own doc comment) for op 0's cross-iteration swap, ops
+		// 253/254/255's side effects, or a pos1 too close to step_3's end.
+		// forceScalarBranchOp lets tests bypass every fast path for a direct
+		// differential comparison.
 		switch {
 		case forceScalarBranchOp:
 			lhash, prev_lhash, rc4s = applyBranchOp(op, pos1, pos2, step_3[:], lhash, prev_lhash, rc4s)
@@ -200,6 +202,8 @@ func astroBWTv3Stream(input []byte, scratch *ScratchData) (data_len uint32) {
 			for i := pos1; i < pos2; i++ {
 				step_3[i] = lut[step_3[i]]
 			}
+		case tryWolfPermuteAVX2(op, pos1, pos2, step_3[:]):
+			// handled by the AVX2 kernel
 		default:
 			lhash, prev_lhash, rc4s = applyBranchOp(op, pos1, pos2, step_3[:], lhash, prev_lhash, rc4s)
 		}
