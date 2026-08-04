@@ -1,0 +1,6 @@
+# compiled test/bench binaries, not source
+*.test
+astrobwt/astrobwtv3/divsufsort_bench/sabench
+cmd/dero-miner/orginal
+cmd/dero-miner/optimized
+cmd/dero-miner/*.log

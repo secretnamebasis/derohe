@@ -2440,9 +2440,8 @@ func AstroBWTv3(input []byte) (outputhash [32]byte) {
 	// we may discard upto ~ 1KiB data from the stream
 	data_len := uint32((tries-4)*256 + (uint64(step_3[253])<<8|uint64(step_3[254]))&0x3ff) // ensure wide  number of variants exists
 
-	//if REFERENCE_MODE {
+	maybeCaptureScratch(scratch.data[:data_len], data_len)
 	text_32_0alloc(scratch.data[:data_len], scratch.sa[:data_len])
-	//}
 
 	if LittleEndian {
 		scratch.hasher.Reset()

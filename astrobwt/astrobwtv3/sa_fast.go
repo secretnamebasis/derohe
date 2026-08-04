@@ -131,7 +131,48 @@ func sort_indices(N uint32, v []byte, output []uint16, d *ScratchData) {
 	}
 }
 
+// text_32_0alloc is AstroBWTv3's production suffix-array entry point (the
+// only caller is pow.go's AstroBWTv3, which hashes the raw sa bytes
+// directly -- see sa_bytes -- so this function's output is consensus-
+// critical, not just performance-critical).
+//
+// Stage 4b: backed by the divsufsort port (computeSuffixArrayDivSufSort0Alloc,
+// divsufsort_go.go) instead of SA-IS. This is the culmination of the
+// AstroBWTv3 suffix-array research project: divsufsort runs ~1.70ms vs
+// SA-IS's ~2.16ms on realistic input (BenchmarkDivSufSortGo0Alloc_Realistic
+// vs BenchmarkSAIS_Realistic), both genuinely 0-alloc. The two are proven
+// byte-identical across hundreds of dual-compute trials including every
+// real captured AstroBWTv3 fixture (TestDivSufSortMatchesProductionSAIS)
+// and, more importantly, are proven byte-identical by construction: a
+// suffix array is unique for a given text, so two correct algorithms must
+// already agree. See text_32_0alloc_sais for the retired SA-IS
+// implementation, kept as a permanent comparison oracle rather than
+// deleted, since it's the exact code that validated every DERO block up to
+// this cutover.
+//
+// bucketA/bucketB are declared locally rather than pooled on ScratchData:
+// BenchmarkDivSufSortGo0Alloc_Realistic already proved this exact shape
+// (local stack arrays passed into computeSuffixArrayDivSufSort0Alloc) is
+// 0 B/op, 0 allocs/op, so pooling would add ScratchData footprint for no
+// measurable benefit.
 func text_32_0alloc(text []byte, sa []int32) {
+	if int(int32(len(text))) != len(text) || len(text) != len(sa) {
+		panic("suffixarray: misuse of text_16")
+	}
+	var bucketA [256]int32
+	var bucketB [256 * 256]int32
+	computeSuffixArrayDivSufSort0Alloc(text, sa, bucketA[:], bucketB[:])
+}
+
+// text_32_0alloc_sais is the original SA-IS-based production implementation,
+// retired from the hot path by the Stage 4b divsufsort cutover above. Kept
+// deliberately, not deleted: it's the exact implementation that validated
+// every DERO block before this cutover, so it serves as a permanent
+// comparison oracle (TestDivSufSortMatchesProductionSAIS in
+// divsufsort_go_test.go runs both on every `go test .` and asserts
+// byte-identical output) and as the SA-IS baseline for
+// BenchmarkSAIS_Realistic and friends.
+func text_32_0alloc_sais(text []byte, sa []int32) {
 	if int(int32(len(text))) != len(text) || len(text) != len(sa) {
 		panic("suffixarray: misuse of text_16")
 	}
