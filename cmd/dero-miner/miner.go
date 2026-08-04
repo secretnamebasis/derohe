@@ -470,6 +470,21 @@ func submitWorker() {
 			defer globals.Recover(1)
 			connection_mutex.Lock()
 			defer connection_mutex.Unlock()
+			// connectionEpoch only advances on a *successful* dial (see
+			// getwork), but a *failed* dial still assigns connection = nil
+			// (websocket.Dial's return value on error) without bumping the
+			// epoch -- so an epoch match alone doesn't guarantee connection
+			// is non-nil: a job fetched before a since-failed reconnect
+			// attempt can still carry the old, still-current epoch while
+			// connection sits nil during the retry-sleep window. Found live
+			// against the simulator (repeated kill/restart during mining):
+			// WriteJSON on a nil *websocket.Conn panics, recovered here but
+			// firing on every queued share for the whole 10s retry sleep --
+			// not a crash, but not something to leave firing either.
+			if connection == nil {
+				atomic.AddUint64(&staleSubmitsDropped, 1)
+				return
+			}
 			connection.WriteJSON(rpc.SubmitBlock_Params{JobID: s.jobID, MiniBlockhashing_blob: s.hashingBlob})
 		}()
 	}
