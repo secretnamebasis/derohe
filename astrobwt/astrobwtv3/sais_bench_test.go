@@ -106,14 +106,6 @@ func BenchmarkSortIndicesFastPath_Realistic(b *testing.B) {
 	scratch := Pool.Get().(*ScratchData)
 	defer Pool.Put(scratch)
 
-	// This path's own scratch (indices/tmp_indices/output) lives here, not on
-	// ScratchData -- it's only ever exercised by this benchmark, not by any
-	// production hash path, so it doesn't belong in the pooled per-worker
-	// struct every real mining thread carries.
-	indices := make([]uint32, MAX_LENGTH+1)
-	tmpIndices := make([]uint32, MAX_LENGTH+1)
-	output := make([]uint16, MAX_LENGTH+1)
-
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -123,7 +115,7 @@ func BenchmarkSortIndicesFastPath_Realistic(b *testing.B) {
 		for j := n; j < n+64 && int(j) < len(scratch.data); j++ {
 			scratch.data[j] = 0
 		}
-		sort_indices(n, scratch.data[:n+64], output, indices, tmpIndices)
+		sort_indices(n, scratch.data[:n+64], scratch.stage1_result[:], scratch)
 	}
 }
 
