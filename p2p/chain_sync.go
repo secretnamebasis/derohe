@@ -254,35 +254,54 @@ try_again:
 	// response only 4096 blocks at a time
 	max_blocks_to_queue := 4096
 	// check whether the objects are in our db or not
-	// until we put in place a parallel object tracker, do it one at a time
+	// batch missing blocks into a single GetObject request instead of one round-trip per block
+	const sync_batch_size = 128
 
 	connection.logger.V(2).Info("response block list", "count", len(response.Block_list))
+
+	var batch [][32]byte
+	flush_batch := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		var orequest ObjectList
+		var oresponse Objects
+		orequest.Block_list = batch
+		fill_common(&orequest.Common)
+		if err := connection.Client.Call("Peer.GetObject", orequest, &oresponse); err != nil {
+			connection.logger.V(2).Error(err, "Call failed GetObject")
+			return err
+		}
+		if err := connection.process_object_response(oresponse, 0, true); err != nil {
+			return err
+		}
+		batch = nil
+		return nil
+	}
+
+	var zero_hash [32]byte
 	for i := range response.Block_list {
+		if response.Block_list[i] == zero_hash { // defensive: some peers may still leak a zero hash on a race at their tip
+			connection.logger.V(2).Info("Peer sent a zero block hash, skipping rest of this batch cycle", "index", i)
+			break
+		}
 		our_topo_order := chain.Load_Block_Topological_order(response.Block_list[i])
 		if our_topo_order != (int64(i)+response.Start_topoheight) || our_topo_order == -1 { // if block is not in our chain, add it to request list
-			//queue_block(request.Block_list[i])
 			if max_blocks_to_queue >= 0 {
 				max_blocks_to_queue--
-				//connection.Send_ObjectRequest([]crypto.Hash{response.Block_list[i]}, []crypto.Hash{})
-				var orequest ObjectList
-				var oresponse Objects
-
-				orequest.Block_list = append(orequest.Block_list, response.Block_list[i])
-				fill_common(&orequest.Common)
-				if err := connection.Client.Call("Peer.GetObject", orequest, &oresponse); err != nil {
-					connection.logger.V(2).Error(err, "Call failed GetObject")
-					return
-				} else { // process the response
-					if err = connection.process_object_response(oresponse, 0, true); err != nil {
+				batch = append(batch, response.Block_list[i])
+				if len(batch) >= sync_batch_size {
+					if err := flush_batch(); err != nil {
 						return
 					}
 				}
-
-				//	fmt.Printf("Queuing block %x height %d  %s", response.Block_list[i], response.Start_height+int64(i), connection.logid)
 			}
 		} else {
 			connection.logger.V(3).Info("We must have queued but we skipped it at height", "blid", fmt.Sprintf("%x", response.Block_list[i]), "height", response.Start_height+int64(i))
 		}
+	}
+	if err := flush_batch(); err != nil {
+		return
 	}
 
 	// request alt-tips ( blocks if we are nearing the main tip )
@@ -370,7 +389,11 @@ func (connection *Connection) process_object_response(response Objects, sent int
 			}
 		}
 
-		if !ok {
+		if !ok && err == errormsg.ErrAlreadyExists {
+			// routine, expected: multiple peers gossip the same new block, only the
+			// first copy needs processing -- not an error
+			connection.logger.V(4).Info("Incoming block already exists, skipping")
+		} else if !ok {
 			connection.logger.V(2).Error(err, "Incoming Block could not be added due to some error")
 		}
 
