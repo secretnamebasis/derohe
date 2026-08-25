@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math/big"
 	"math/bits"
+	"runtime"
 	"sync/atomic"
 	"time"
 
@@ -95,6 +96,22 @@ func (connection *Connection) bootstrap_chain() error {
 
 	commit_version := uint64(0)
 
+	// pipeline a window of concurrent TreeSection requests instead of
+	// waiting for each chunk's round-trip before firing the next one.
+	// results are drained in COMPLETION order (not index order) so one slow
+	// chunk can't head-of-line-block chunks that already finished -- chunk
+	// writes are commutative (disjoint key ranges into the same tree), so
+	// there is no ordering requirement here, unlike sync_chain's block adds.
+	pipeline, threads := 0, runtime.GOMAXPROCS(0) // N.B. Optimize by profiling hardware
+	switch {
+	case threads < 1:
+		pipeline = 1
+	case threads > 32:
+		pipeline = 32
+	default:
+		pipeline = threads
+	}
+
 	{ // fetch and commit balance tree
 
 		chunksize := int64(640)
@@ -114,19 +131,12 @@ func (connection *Connection) bootstrap_chain() error {
 		total_keys := 0
 
 		if state.Step < 2 {
-			// pipeline a bounded window of concurrent TreeSection requests instead of
-			// waiting for each chunk's round-trip before firing the next one.
-			// results are drained in COMPLETION order (not index order) so one slow
-			// chunk can't head-of-line-block chunks that already finished -- chunk
-			// writes are commutative (disjoint key ranges into the same tree), so
-			// there is no ordering requirement here, unlike sync_chain's block adds.
-			const pipeline_window = 16
 
 			type indexed_result struct {
 				index int64
 				call  *rpc2.Call
 			}
-			results := make(chan indexed_result, pipeline_window)
+			results := make(chan indexed_result, pipeline)
 
 			fire := func(i int64) {
 				var section [8]byte
@@ -143,7 +153,8 @@ func (connection *Connection) bootstrap_chain() error {
 
 			next_fire := state.Chunk
 			inflight_count := int64(0)
-			for ; next_fire < chunks && inflight_count < pipeline_window; next_fire++ {
+			tx_pipeline := int64(pipeline)
+			for ; next_fire < chunks && inflight_count < tx_pipeline; next_fire++ {
 				fire(next_fire)
 				inflight_count++
 			}
@@ -317,15 +328,15 @@ func (connection *Connection) bootstrap_chain() error {
 					return sc_fetch_result{key: key, keys: all_keys, values: all_values}
 				}
 
-				const sc_pipeline_window = 16
-				sc_results := make(chan sc_fetch_result, sc_pipeline_window)
+				sc_results := make(chan sc_fetch_result, pipeline)
 				launch := func(idx int) {
 					go func() { sc_results <- fetch_one_sc(ts_response.Keys[idx]) }()
 				}
 
 				sc_next := 0
 				sc_inflight := 0
-				for ; sc_next < len(ts_response.Keys) && sc_inflight < sc_pipeline_window; sc_next++ {
+				sc_pipeline := int(pipeline)
+				for ; sc_next < len(ts_response.Keys) && sc_inflight < sc_pipeline; sc_next++ {
 					launch(sc_next)
 					sc_inflight++
 				}
