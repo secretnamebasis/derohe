@@ -125,21 +125,60 @@ func bootstrap_chunk_fanout_peers(fallback *Connection, target int64) []*Connect
 	return eligible
 }
 
+// bootstrap_known_dead_peers is a lightweight, phase-scoped, concurrency-safe
+// record of which fan-out peers have already been discovered dead during the
+// current phase (balance tree or SC-meta, including SC-meta's own nested
+// per-SC fetches, which share the same instance as their enclosing outer
+// loop). fanout_peers is a fixed snapshot taken once per phase and never
+// refreshed, so a peer that dies stays in that snapshot forever - without
+// this, each chunk that happens to select a since-died peer has to
+// independently rediscover it's dead via its own already_tried exclusion,
+// which is scoped to just that one chunk. Sharing the discovery across every
+// chunk in the phase turns repeated dead-peer rediscovery (observed live:
+// chains of 3-4+ dead-peer hops for a single stuck chunk) into a one-time
+// cost paid by whichever chunk finds it first.
+type bootstrap_known_dead_peers struct {
+	mu   sync.Mutex
+	dead map[string]bool
+}
+
+func new_bootstrap_known_dead_peers() *bootstrap_known_dead_peers {
+	return &bootstrap_known_dead_peers{dead: map[string]bool{}}
+}
+
+func (k *bootstrap_known_dead_peers) mark(addr string) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.dead[addr] = true
+}
+
+func (k *bootstrap_known_dead_peers) is_dead(addr string) bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.dead[addr]
+}
+
 // pick_alternate_chunk_peer returns the first eligible peer not yet tried
-// for a specific chunk, for retrying a chunk-fetch failure against a
-// different peer instead of aborting the whole attempt. Unlike
-// pick_alternate_connection (sync_dispatch.go), this doesn't re-check
-// Pruned/topoheight eligibility - peers passed in are already filtered by
-// bootstrap_eligible_peers, and that filter doesn't change meaning between
-// one chunk and the next the way per-block Pruned eligibility does across a
-// range of topoheights. Returns nil once every eligible peer has been tried
-// for this chunk - the caller then genuinely gives up, rather than retrying
+// for a specific chunk and not already known dead for this phase, for
+// retrying a chunk-fetch failure against a different peer instead of
+// aborting the whole attempt. Unlike pick_alternate_connection
+// (sync_dispatch.go), this doesn't re-check Pruned/topoheight eligibility -
+// peers passed in are already filtered by bootstrap_eligible_peers, and
+// that filter doesn't change meaning between one chunk and the next the way
+// per-block Pruned eligibility does across a range of topoheights. Returns
+// nil once every eligible peer has been tried or is already known dead for
+// this chunk - the caller then genuinely gives up, rather than retrying
 // forever.
-func pick_alternate_chunk_peer(peers []*Connection, already_tried map[string]bool) *Connection {
+func pick_alternate_chunk_peer(peers []*Connection, already_tried map[string]bool, known_dead *bootstrap_known_dead_peers) *Connection {
 	for _, p := range peers {
-		if !already_tried[p.Addr.String()] {
-			return p
+		addr := p.Addr.String()
+		if already_tried[addr] {
+			continue
 		}
+		if known_dead != nil && known_dead.is_dead(addr) {
+			continue
+		}
+		return p
 	}
 	return nil
 }

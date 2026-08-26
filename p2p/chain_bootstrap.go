@@ -168,7 +168,28 @@ func (connection *Connection) bootstrap_chain() error {
 			// (which is shaped for block fetch, not chunk fetch, and stays
 			// untouched here).
 			fanout_peers := bootstrap_chunk_fanout_peers(connection, request.TopoHeights[0])
-			round_robin := func(i int64) *Connection { return fanout_peers[i%int64(len(fanout_peers))] }
+
+			// fanout_peers is a fixed snapshot for this whole phase - as its
+			// peers die off over what can be several minutes, known_dead
+			// lets one chunk's discovery immediately help every other
+			// chunk, instead of each independently re-learning the same
+			// dead peer through its own (per-chunk) already_tried
+			// exclusion. See bootstrap_known_dead_peers's own doc comment.
+			known_dead := new_bootstrap_known_dead_peers()
+			round_robin := func(i int64) *Connection {
+				n := int64(len(fanout_peers))
+				for attempt := int64(0); attempt < n; attempt++ {
+					p := fanout_peers[(i+attempt)%n]
+					if !known_dead.is_dead(p.Addr.String()) {
+						return p
+					}
+				}
+				// everyone's dead - fall back to the plain modulo pick
+				// anyway; the retry path will discover it's dead too and
+				// either find a survivor or genuinely give up, same as
+				// before this fix.
+				return fanout_peers[i%n]
+			}
 
 			// Scale the in-flight request budget with the number of fan-out
 			// peers, not one fixed window shared across all of them.
@@ -233,11 +254,12 @@ func (connection *Connection) bootstrap_chain() error {
 			already_tried := map[int64]map[string]bool{}
 			retry_or_give_up := func(idx int64, failed_peer *Connection, cause error) (retried bool, err error) {
 				failed_peer.exit()
+				known_dead.mark(failed_peer.Addr.String())
 				if already_tried[idx] == nil {
 					already_tried[idx] = map[string]bool{}
 				}
 				already_tried[idx][failed_peer.Addr.String()] = true
-				if alt := pick_alternate_chunk_peer(fanout_peers, already_tried[idx]); alt != nil {
+				if alt := pick_alternate_chunk_peer(fanout_peers, already_tried[idx], known_dead); alt != nil {
 					alt.logger.V(2).Info("retrying balance-tree chunk on alternate peer", "index", idx, "failed_peer", failed_peer.Addr.String(), "cause", cause)
 					do_fire(idx, alt)
 					inflight_count++
@@ -357,7 +379,22 @@ func (connection *Connection) bootstrap_chain() error {
 		// several more minutes than step 1, long enough for the real peer
 		// pool to have changed since step 1 started.
 		fanout_peers := bootstrap_chunk_fanout_peers(connection, request.TopoHeights[0])
-		round_robin := func(i int64) *Connection { return fanout_peers[i%int64(len(fanout_peers))] }
+
+		// Same known_dead sharing as the balance tree above - this phase's
+		// own instance, shared by the outer SC-meta fetch below AND its
+		// nested per-SC fetches, since both draw from this same
+		// fanout_peers snapshot and run concurrently over the same span.
+		known_dead := new_bootstrap_known_dead_peers()
+		round_robin := func(i int64) *Connection {
+			n := int64(len(fanout_peers))
+			for attempt := int64(0); attempt < n; attempt++ {
+				p := fanout_peers[(i+attempt)%n]
+				if !known_dead.is_dead(p.Addr.String()) {
+					return p
+				}
+			}
+			return fanout_peers[i%n]
+		}
 
 		// pipeline the OUTER SC-meta chunk fetch too (same fire-ahead pattern
 		// as the balance tree above): this loop was left fully sequential
@@ -416,11 +453,12 @@ func (connection *Connection) bootstrap_chain() error {
 		already_tried_sc_meta := map[int64]map[string]bool{}
 		retry_or_give_up_sc_meta := func(idx int64, failed_peer *Connection, cause error) (retried bool, err error) {
 			failed_peer.exit()
+			known_dead.mark(failed_peer.Addr.String())
 			if already_tried_sc_meta[idx] == nil {
 				already_tried_sc_meta[idx] = map[string]bool{}
 			}
 			already_tried_sc_meta[idx][failed_peer.Addr.String()] = true
-			if alt := pick_alternate_chunk_peer(fanout_peers, already_tried_sc_meta[idx]); alt != nil {
+			if alt := pick_alternate_chunk_peer(fanout_peers, already_tried_sc_meta[idx], known_dead); alt != nil {
 				alt.logger.V(2).Info("retrying SC-meta chunk on alternate peer", "index", idx, "failed_peer", failed_peer.Addr.String(), "cause", cause)
 				do_fire_sc_meta(idx, alt)
 				inflight_count++
@@ -561,8 +599,9 @@ func (connection *Connection) bootstrap_chain() error {
 						}
 						failed_peer := peer
 						failed_peer.exit()
+						known_dead.mark(failed_peer.Addr.String())
 						already_tried[failed_peer.Addr.String()] = true
-						alt := pick_alternate_chunk_peer(fanout_peers, already_tried)
+						alt := pick_alternate_chunk_peer(fanout_peers, already_tried, known_dead)
 						if alt == nil {
 							return res
 						}
