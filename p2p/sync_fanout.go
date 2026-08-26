@@ -16,14 +16,15 @@
 
 package p2p
 
-// kata cycle #11: the permanent, default catch-up path for trigger_sync()
+// fanout_sync is the permanent, default catch-up path for trigger_sync()
 // when chain.Sync is true (fast-sync/bootstrap_chain is a separate
-// mechanism, untouched). Reuses every piece proven real across cycles 3-10:
-// Pruned-aware dispatch (run_fanout_dispatch), retry against a different
-// peer (pick_alternate_connection), and an ascending-order commit into
+// mechanism, untouched). It combines Pruned-aware dispatch
+// (run_fanout_dispatch), retry against a different peer
+// (pick_alternate_connection), and an ascending-order commit into
 // chain.Add_Complete_Block guarded against panics (a real, pre-existing
-// SC-execution panic was found live in cycle 6 - normal sync is shielded by
-// cron.Recover, this path needs its own recover since it's a direct call).
+// SC-execution panic was found live during development - normal sync is
+// shielded by cron.Recover, this path needs its own recover since it's a
+// direct call).
 //
 // Called from trigger_sync() as the PRIMARY path; returns false when its
 // own preconditions aren't met (fewer than 2 eligible peers, the Chain()
@@ -40,7 +41,7 @@ import (
 	"github.com/deroproject/derohe/metrics"
 )
 
-const fanout_sync_batch_size = 32 // double the value proven in cycles 9-10's real trials
+const fanout_sync_batch_size = 32 // double the value proven safe in real trials against live peers
 const fanout_sync_max_attempts = 3
 const fanout_sync_max_consecutive_failures = 3
 
@@ -156,14 +157,14 @@ func fanout_sync(candidates []*Connection) bool {
 		work = append(work, block_work{topoheight: p.topoheight})
 	}
 
-	// kata cycle 12: scale concurrency to real peer availability instead of a
-	// fixed pool - a fixed worker_count=4 left most of a tick's real,
-	// currently-eligible peers completely unused (tonight's real runs saw
-	// 31-32 eligible peers per tick against a batch of 32). Capping at
-	// len(work) means we never spin up more workers than there are units -
-	// excess workers would just idle under run_fanout_dispatch's work-
-	// stealing model. This also spreads load thinner per individual peer
-	// (each peer asked for ~1 block/tick instead of ~8), not thicker.
+	// Scale concurrency to real peer availability instead of a fixed pool -
+	// a fixed worker_count=4 left most of a tick's real, currently-eligible
+	// peers completely unused (real runs observed 31-32 eligible peers per
+	// tick against a batch of 32). Capping at len(work) means we never spin
+	// up more workers than there are units - excess workers would just idle
+	// under run_fanout_dispatch's work-stealing model. This also spreads
+	// load thinner per individual peer (each peer asked for ~1 block/tick
+	// instead of ~8), not thicker.
 	worker_count := len(lagging)
 	if worker_count > len(work) {
 		worker_count = len(work)
@@ -233,11 +234,11 @@ func fanout_sync(candidates []*Connection) bool {
 		cbl, _ := ConvertCBlock_To_CompleteBlock(cblock)
 		accepted := false
 		func() {
-			// A real, pre-existing SC-execution panic was found live in
-			// cycle 6 (graviton "leaf not found: collision"). Normal sync
-			// is shielded by cron.Recover; this direct call is not, so an
-			// unrecovered panic here would crash the whole daemon instead
-			// of just failing one block.
+			// A real, pre-existing SC-execution panic was found live during
+			// development (graviton "leaf not found: collision"). Normal
+			// sync is shielded by cron.Recover; this direct call is not, so
+			// an unrecovered panic here would crash the whole daemon
+			// instead of just failing one block.
 			defer func() {
 				if r := recover(); r != nil {
 					logger.V(0).Error(nil, "fanout_sync: recovered panic during Add_Complete_Block", "topoheight", topo, "r", r)

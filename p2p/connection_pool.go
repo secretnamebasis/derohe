@@ -708,11 +708,10 @@ func trigger_sync() {
 					metrics.Set.GetOrCreateCounter("blockchain_sync_total").Inc() // tracks number of syncs
 
 					if chain.Sync {
-						// kata cycle 11: fan out the catch-up batch across all
-						// currently-lagging peers concurrently (real fetch/verify/
-						// commit, proven in cycles 3-10). Falls back to the
-						// original single-connection sync_chain() when fan-out's
-						// own preconditions aren't met (e.g. only one real peer).
+						// fan out the catch-up batch across all currently-lagging
+						// peers concurrently. Falls back to the original
+						// single-connection sync_chain() when fan-out's own
+						// preconditions aren't met (e.g. only one real peer).
 						if !fanout_sync(clist) {
 							connection.sync_chain()
 							connection.logger.V(1).Info("sync done (single-peer fallback)")

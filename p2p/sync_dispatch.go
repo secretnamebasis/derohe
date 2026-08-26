@@ -21,18 +21,14 @@ import (
 	"sync/atomic"
 )
 
-// kata cycle #2, test item 0: a minimal work-stealing dispatcher prototype.
-// Log-only/no-op - it does not call any RPC and does not touch chain state.
-// Not called from trigger_sync yet; exercised only by sync_dispatch_test.go
-// until test item 1 (running it against a real live node).
-//
-// kata cycle #3: assignment is now Pruned-aware, per work unit (not a
-// blanket per-peer exclusion like trigger_sync's own check) - a peer is
-// eligible for a unit only if it hasn't pruned that specific topoheight
-// away yet. A unit no connected peer can serve is reported back rather
-// than silently misassigned. Pruned is read via atomic.LoadInt64 since
-// it's touched by concurrent worker goroutines here and nothing enforces
-// safe concurrent access at its (unmodified) write site in rpc_handshake.go.
+// run_fanout_dispatch assigns work-stealing units to a fixed pool of
+// workers. Assignment is Pruned-aware, per work unit (not a blanket
+// per-peer exclusion like trigger_sync's own check) - a peer is eligible
+// for a unit only if it hasn't pruned that specific topoheight away yet.
+// A unit no connected peer can serve is reported back rather than
+// silently misassigned. Pruned is read via atomic.LoadInt64 since it's
+// touched by concurrent worker goroutines here and nothing enforces safe
+// concurrent access at its (unmodified) write site in rpc_handshake.go.
 
 // block_work is one unit of work in the shared queue - a single missing
 // block, addressed by topoheight. One-block-per-unit matches the dev's
@@ -125,9 +121,9 @@ func run_fanout_dispatch(work []block_work, connections []*Connection, worker_co
 	return results, unfulfilled
 }
 
-// kata cycle #10: a unit's originally-assigned connection can fail the
-// actual fetch (network hiccup, peer briefly busy) even though it was
-// Pruned-eligible at assignment time. pick_alternate_connection finds a
+// pick_alternate_connection handles the case where a unit's originally-
+// assigned connection fails the actual fetch (network hiccup, peer briefly
+// busy) even though it was Pruned-eligible at assignment time. It finds a
 // different eligible connection for a retry, excluding addresses already
 // tried for this unit - returns nil if none remain (caller then reports a
 // genuine, final failure rather than retrying forever).

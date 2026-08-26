@@ -21,10 +21,9 @@ import (
 	"testing"
 )
 
-// kata cycle #2, test item 0. Synthetic connections only - no real network,
-// no RPC, no chain state. Proves the work-stealing wiring compiles and
-// distributes work across multiple connections before item 1 points it at
-// a real live node.
+// Synthetic connections only - no real network, no RPC, no chain state.
+// Proves the work-stealing wiring compiles and distributes work across
+// multiple connections.
 func Test_Fanout_Dispatch(t *testing.T) {
 	connections := []*Connection{
 		{Addr: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 20201}},
@@ -75,12 +74,12 @@ func Test_Fanout_Dispatch_No_Connections(t *testing.T) {
 	}
 }
 
-// kata cycle #3, test item 1. Real peer addresses and Pruned values from
-// cycle 2's live-node snapshot (2026-08-25 derod.log): 194.77.71.65 and
-// 38.180.60.233, both real mainnet peers that were blanket-excluded by
-// trigger_sync's coarse check. A work sample straddling their two real
-// Pruned watermarks proves the per-unit filter recovers eligibility where
-// the blanket check couldn't.
+// Real peer addresses and Pruned values observed from a live node
+// (2026-08-25 derod.log): 194.77.71.65 and 38.180.60.233, both real
+// mainnet peers that were blanket-excluded by trigger_sync's coarse
+// check. A work sample straddling their two real Pruned watermarks
+// proves the per-unit filter recovers eligibility where the blanket
+// check couldn't.
 func Test_Fanout_Dispatch_Real_Pruned_Watermarks(t *testing.T) {
 	const pruned_a = 7410274 // real: 194.77.71.65
 	const pruned_b = 7471050 // real: 38.180.60.233
@@ -124,8 +123,8 @@ func Test_Fanout_Dispatch_Real_Pruned_Watermarks(t *testing.T) {
 	}
 }
 
-// kata cycle #3, test item 2: a unit that literally no connected peer can
-// serve must be reported in unfulfilled, never silently misassigned.
+// A unit that literally no connected peer can serve must be reported in
+// unfulfilled, never silently misassigned.
 func Test_Fanout_Dispatch_Unfulfillable_Unit(t *testing.T) {
 	addr, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:20201")
 	connections := []*Connection{{Addr: addr, Pruned: 5_000_000}}
@@ -141,11 +140,11 @@ func Test_Fanout_Dispatch_Unfulfillable_Unit(t *testing.T) {
 	}
 }
 
-// kata cycle #10, test item 1: simulates one connection failing for a
-// specific unit (by marking it already_tried) while another eligible
-// connection exists - pick_alternate_connection must recover by returning
-// the other one, never the failed one, and must return nil once every
-// eligible connection has actually been exhausted.
+// Simulates one connection failing for a specific unit (by marking it
+// already_tried) while another eligible connection exists -
+// pick_alternate_connection must recover by returning the other one,
+// never the failed one, and must return nil once every eligible
+// connection has actually been exhausted.
 func Test_Pick_Alternate_Connection_Recovers_From_One_Failure(t *testing.T) {
 	addr_a, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:20201")
 	addr_b, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:20202")
