@@ -445,8 +445,14 @@ func (connection *Connection) bootstrap_chain() error {
 			done := make(chan *rpc2.Call, 1)
 			call := peer.Client.Go("Peer.TreeSection", ts_request, &Response_Tree_Section_Struct{}, done)
 			go func() {
-				<-done
-				sc_meta_results <- sc_meta_indexed_result{index: i, call: call, peer: peer}
+				// same timeout reasoning as the balance tree's do_fire -
+				// see that comment for the full explanation.
+				select {
+				case <-done:
+					sc_meta_results <- sc_meta_indexed_result{index: i, call: call, peer: peer}
+				case <-time.After(bootstrap_chunk_request_timeout):
+					sc_meta_results <- sc_meta_indexed_result{index: i, call: &rpc2.Call{Error: fmt.Errorf("timed out after %s waiting for a response", bootstrap_chunk_request_timeout)}, peer: peer}
+				}
 			}()
 		}
 		// live_pool.pick can return nil if every peer in the pool has died
@@ -550,15 +556,35 @@ func (connection *Connection) bootstrap_chain() error {
 					err          error
 				}
 
+				// call_with_timeout is attempt_fetch_sc's own synchronous call
+				// site: unlike do_fire/do_fire_sc_meta it must return a value
+				// immediately (it's invoked inline from fetch_one_sc's retry
+				// loop below), so the timeout is an inline select rather than
+				// a background goroutine feeding a results channel.
+				call_with_timeout := func(peer *Connection, req Request_Tree_Section_Struct) (*Response_Tree_Section_Struct, error) {
+					var response Response_Tree_Section_Struct
+					done := make(chan *rpc2.Call, 1)
+					call := peer.Client.Go("Peer.TreeSection", req, &response, done)
+					select {
+					case <-done:
+						if call.Error != nil {
+							return nil, call.Error
+						}
+						return &response, nil
+					case <-time.After(bootstrap_chunk_request_timeout):
+						return nil, fmt.Errorf("timed out after %s waiting for a response", bootstrap_chunk_request_timeout)
+					}
+				}
+
 				// One attempt at a whole SC's data tree (including any of its
 				// own continuation chunks for large SCs) against a specific
 				// peer - no retry logic here, that's fetch_one_sc's job below.
 				attempt_fetch_sc := func(key []byte, peer *Connection) sc_fetch_result {
 					var section [8]byte
 					sc_request := Request_Tree_Section_Struct{Topo: request.TopoHeights[0], TreeName: key, Section: section[:], SectionLength: uint64(0)}
-					var sc_response Response_Tree_Section_Struct
 					fill_common(&sc_request.Common)
-					if err := peer.Client.Call("Peer.TreeSection", sc_request, &sc_response); err != nil {
+					sc_response, err := call_with_timeout(peer, sc_request)
+					if err != nil {
 						return sc_fetch_result{key: key, err: fmt.Errorf("SC data-tree fetch from %s: %w", peer.Addr.String(), err)}
 					}
 
@@ -589,9 +615,9 @@ func (connection *Connection) bootstrap_chain() error {
 					for k := int64(0); k < sc_chunks; k++ {
 						binary.BigEndian.PutUint64(sc_section[:], bits.Reverse64(uint64(k))) // place reverse path
 						sc_ts_request := Request_Tree_Section_Struct{Topo: request.TopoHeights[0], TreeName: key, Section: sc_section[:], SectionLength: uint64(sc_path_length)}
-						var sc_ts_response Response_Tree_Section_Struct
 						fill_common(&sc_ts_request.Common)
-						if err := peer.Client.Call("Peer.TreeSection", sc_ts_request, &sc_ts_response); err != nil {
+						sc_ts_response, err := call_with_timeout(peer, sc_ts_request)
+						if err != nil {
 							return sc_fetch_result{key: key, err: fmt.Errorf("SC data-tree continuation fetch from %s: %w", peer.Addr.String(), err)}
 						}
 						if len(sc_ts_response.Keys) != len(sc_ts_response.Values) {
