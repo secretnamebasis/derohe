@@ -149,22 +149,38 @@ func (connection *Connection) bootstrap_chain() error {
 
 		if state.Step < 2 {
 
+			// Fan the chunk fetch itself across every eligible peer, not just
+			// the single quorum-chosen connection - reuses the same
+			// target-based eligibility already proven for the manifest
+			// quorum. round_robin(i) picks a peer per chunk index; with
+			// requests already fired ahead and drained in completion order
+			// (below), a chunk assigned to a slower peer just completes
+			// later rather than blocking anything, so this gets most of the
+			// benefit of real work-stealing without needing to build a
+			// second dispatcher alongside run_fanout_dispatch's proven one
+			// (which is shaped for block fetch, not chunk fetch, and stays
+			// untouched here).
+			fanout_peers := bootstrap_chunk_fanout_peers(connection, request.TopoHeights[0])
+			round_robin := func(i int64) *Connection { return fanout_peers[i%int64(len(fanout_peers))] }
+
 			type indexed_result struct {
 				index int64
 				call  *rpc2.Call
+				peer  *Connection
 			}
 			results := make(chan indexed_result, pipeline)
 
 			fire := func(i int64) {
+				peer := round_robin(i)
 				var section [8]byte
 				binary.BigEndian.PutUint64(section[:], bits.Reverse64(uint64(i))) // place reverse path
 				ts_request := &Request_Tree_Section_Struct{Topo: request.TopoHeights[0], TreeName: []byte(config.BALANCE_TREE), Section: section[:], SectionLength: uint64(path_length)}
 				fill_common(&ts_request.Common)
 				done := make(chan *rpc2.Call, 1)
-				call := connection.Client.Go("Peer.TreeSection", ts_request, &Response_Tree_Section_Struct{}, done)
+				call := peer.Client.Go("Peer.TreeSection", ts_request, &Response_Tree_Section_Struct{}, done)
 				go func() {
 					<-done
-					results <- indexed_result{index: i, call: call}
+					results <- indexed_result{index: i, call: call, peer: peer}
 				}()
 			}
 
@@ -184,9 +200,10 @@ func (connection *Connection) bootstrap_chain() error {
 				res := <-results
 				inflight_count--
 				if res.call.Error != nil {
-					return res.call.Error
+					return fmt.Errorf("balance-tree chunk %d fetch from %s: %w", res.index, res.peer.Addr.String(), res.call.Error)
 				}
 				ts_response := res.call.Reply.(*Response_Tree_Section_Struct)
+				res.peer.logger.V(2).Info("served balance-tree chunk", "index", res.index)
 
 				// now we must write all the state changes to gravition
 				var balance_tree *graviton.Tree

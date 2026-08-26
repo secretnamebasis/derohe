@@ -98,6 +98,25 @@ func bootstrap_eligible_peers(candidates []*Connection, target int64) (eligible 
 	return
 }
 
+// bootstrap_chunk_fanout_peers returns the peer pool to fan TreeSection
+// chunk-fetch requests across for the given target topoheight, reusing the
+// same eligibility check already proven for the manifest quorum. Falls back
+// to just the single connection bootstrap_chain() is already using when
+// fewer than 2 peers are eligible, matching fanout_sync's own precedent
+// (sync_fanout.go) of requiring at least 2 before attempting fan-out at
+// all - so behavior is unchanged in the small-peer-pool case.
+func bootstrap_chunk_fanout_peers(fallback *Connection, target int64) []*Connection {
+	all := []*Connection{}
+	for _, c := range UniqueConnections() {
+		all = append(all, c)
+	}
+	eligible := bootstrap_eligible_peers(all, target)
+	if len(eligible) < 2 {
+		return []*Connection{fallback}
+	}
+	return eligible
+}
+
 // is_trusted_peer checks whether a connection's address matches one of the
 // operator's explicitly configured --add-priority-node entries. Connection
 // has no per-peer trust field (SyncNode is a global mode flag, not a
