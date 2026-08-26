@@ -238,6 +238,7 @@ func (connection *Connection) bootstrap_chain() error {
 				}
 				already_tried[idx][failed_peer.Addr.String()] = true
 				if alt := pick_alternate_chunk_peer(fanout_peers, already_tried[idx]); alt != nil {
+					alt.logger.V(2).Info("retrying balance-tree chunk on alternate peer", "index", idx, "failed_peer", failed_peer.Addr.String(), "cause", cause)
 					do_fire(idx, alt)
 					inflight_count++
 					return true, nil
@@ -389,8 +390,7 @@ func (connection *Connection) bootstrap_chain() error {
 		}
 		sc_meta_results := make(chan sc_meta_indexed_result, outer_pipeline)
 
-		fire_sc_meta := func(i int64) {
-			peer := round_robin(i)
+		do_fire_sc_meta := func(i int64, peer *Connection) {
 			var section [8]byte
 			binary.BigEndian.PutUint64(section[:], bits.Reverse64(uint64(i))) // place reverse path
 			ts_request := &Request_Tree_Section_Struct{Topo: request.TopoHeights[0], TreeName: []byte(config.SC_META), Section: section[:], SectionLength: uint64(path_length)}
@@ -402,6 +402,7 @@ func (connection *Connection) bootstrap_chain() error {
 				sc_meta_results <- sc_meta_indexed_result{index: i, call: call, peer: peer}
 			}()
 		}
+		fire_sc_meta := func(i int64) { do_fire_sc_meta(i, round_robin(i)) }
 
 		next_fire := state.Chunk
 		inflight_count := int64(0)
@@ -410,16 +411,37 @@ func (connection *Connection) bootstrap_chain() error {
 			inflight_count++
 		}
 
+		// Same retry-on-alternate-peer pattern as the balance tree above -
+		// see that block's comment for the full reasoning.
+		already_tried_sc_meta := map[int64]map[string]bool{}
+		retry_or_give_up_sc_meta := func(idx int64, failed_peer *Connection, cause error) (retried bool, err error) {
+			failed_peer.exit()
+			if already_tried_sc_meta[idx] == nil {
+				already_tried_sc_meta[idx] = map[string]bool{}
+			}
+			already_tried_sc_meta[idx][failed_peer.Addr.String()] = true
+			if alt := pick_alternate_chunk_peer(fanout_peers, already_tried_sc_meta[idx]); alt != nil {
+				alt.logger.V(2).Info("retrying SC-meta chunk on alternate peer", "index", idx, "failed_peer", failed_peer.Addr.String(), "cause", cause)
+				do_fire_sc_meta(idx, alt)
+				inflight_count++
+				return true, nil
+			}
+			return false, fmt.Errorf("SC-meta chunk %d exhausted all eligible peers: %w", idx, cause)
+		}
+
 		completed := make(map[int64]bool)
 		low_water_mark := state.Chunk
 		total_to_do := chunks - state.Chunk
 
-		for done_count := int64(0); done_count < total_to_do; done_count++ {
+		for done_count := int64(0); done_count < total_to_do; {
 			res := <-sc_meta_results
 			inflight_count--
 			if res.call.Error != nil {
-				res.peer.exit()
-				return fmt.Errorf("SC-meta chunk %d fetch from %s: %w", res.index, res.peer.Addr.String(), res.call.Error)
+				if retried, giveup_err := retry_or_give_up_sc_meta(res.index, res.peer, res.call.Error); retried {
+					continue
+				} else {
+					return giveup_err
+				}
 			}
 			ts_response := *res.call.Reply.(*Response_Tree_Section_Struct)
 			i := res.index
@@ -444,8 +466,11 @@ func (connection *Connection) bootstrap_chain() error {
 
 				if len(ts_response.Keys) != len(ts_response.Values) {
 					//rlog.Warnf("Incoming Key count %d value count %d \"%s\" ", len(ts_response.Keys), len(ts_response.Values), globals.CTXString(connection.logger))
-					res.peer.exit()
-					return fmt.Errorf("mismatched key and value count")
+					if retried, giveup_err := retry_or_give_up_sc_meta(res.index, res.peer, fmt.Errorf("mismatched key and value count")); retried {
+						continue
+					} else {
+						return giveup_err
+					}
 				}
 				//rlog.Debugf("SC chunk %d Will write %d keys\n", i, len(ts_response.Keys))
 
@@ -464,18 +489,15 @@ func (connection *Connection) bootstrap_chain() error {
 					err          error
 				}
 
-				// idx picks the peer (round_robin, same pool as the outer
-				// SC-meta fetch) - one peer per whole SC, including any of
-				// its own continuation chunks below, rather than fanning out
-				// a fourth concurrency level within a single SC's own tree.
-				fetch_one_sc := func(idx int, key []byte) sc_fetch_result {
-					peer := round_robin(int64(idx))
+				// One attempt at a whole SC's data tree (including any of its
+				// own continuation chunks for large SCs) against a specific
+				// peer - no retry logic here, that's fetch_one_sc's job below.
+				attempt_fetch_sc := func(key []byte, peer *Connection) sc_fetch_result {
 					var section [8]byte
 					sc_request := Request_Tree_Section_Struct{Topo: request.TopoHeights[0], TreeName: key, Section: section[:], SectionLength: uint64(0)}
 					var sc_response Response_Tree_Section_Struct
 					fill_common(&sc_request.Common)
 					if err := peer.Client.Call("Peer.TreeSection", sc_request, &sc_response); err != nil {
-						peer.exit()
 						return sc_fetch_result{key: key, err: fmt.Errorf("SC data-tree fetch from %s: %w", peer.Addr.String(), err)}
 					}
 
@@ -509,11 +531,9 @@ func (connection *Connection) bootstrap_chain() error {
 						var sc_ts_response Response_Tree_Section_Struct
 						fill_common(&sc_ts_request.Common)
 						if err := peer.Client.Call("Peer.TreeSection", sc_ts_request, &sc_ts_response); err != nil {
-							peer.exit()
 							return sc_fetch_result{key: key, err: fmt.Errorf("SC data-tree continuation fetch from %s: %w", peer.Addr.String(), err)}
 						}
 						if len(sc_ts_response.Keys) != len(sc_ts_response.Values) {
-							peer.exit()
 							return sc_fetch_result{key: key, err: fmt.Errorf("mismatched key and value count")}
 						}
 						all_keys = append(all_keys, sc_ts_response.Keys...)
@@ -521,6 +541,34 @@ func (connection *Connection) bootstrap_chain() error {
 					}
 					peer.logger.V(3).Info("served SC data-tree fetch", "key", fmt.Sprintf("%x", key))
 					return sc_fetch_result{key: key, keys: all_keys, values: all_values}
+				}
+
+				// idx picks the first peer to try (round_robin, same pool as
+				// the outer SC-meta fetch). On failure, retry the whole SC
+				// (including any continuation chunks) against a different
+				// untried eligible peer, same retry-on-alternate-peer pattern
+				// as the balance tree and SC-meta outer loop above - self
+				// contained here since this whole call already runs in its
+				// own goroutine, so there's no outer drain-loop bookkeeping
+				// to coordinate with.
+				fetch_one_sc := func(idx int, key []byte) sc_fetch_result {
+					peer := round_robin(int64(idx))
+					already_tried := map[string]bool{}
+					for {
+						res := attempt_fetch_sc(key, peer)
+						if res.err == nil {
+							return res
+						}
+						failed_peer := peer
+						failed_peer.exit()
+						already_tried[failed_peer.Addr.String()] = true
+						alt := pick_alternate_chunk_peer(fanout_peers, already_tried)
+						if alt == nil {
+							return res
+						}
+						alt.logger.V(3).Info("retrying SC data-tree fetch on alternate peer", "key", fmt.Sprintf("%x", key), "failed_peer", failed_peer.Addr.String(), "cause", res.err)
+						peer = alt
+					}
 				}
 
 				sc_results := make(chan sc_fetch_result, pipeline)
@@ -586,6 +634,7 @@ func (connection *Connection) bootstrap_chain() error {
 			if low_water_mark != prev_water_mark {
 				connection.logger.Info("Bootstrap in progress(step 2)", "percent", float32(low_water_mark*100)/float32(chunks))
 			}
+			done_count++
 
 			if next_fire < chunks {
 				fire_sc_meta(next_fire)
