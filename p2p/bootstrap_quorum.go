@@ -341,14 +341,14 @@ const bootstrap_warmup_poll_interval = 2 * time.Second
 // state.Height here would always see it non-zero and skip the wait even on
 // the genuine first call (a real bug caught live: zero warmup_wait log
 // lines ever appeared, even on a fresh run - confirmed by checking the
-// actual log instead of assuming the fix worked).
+// actual log rather than assuming the fix worked).
 var bootstrap_warmup_done bool
 
 // bootstrap_warmup_wait lets the real peer pool grow before the manifest
-// tier decision fires. Real observation (this session, live): trigger_sync
-// fires the first bootstrap attempt only ~5-6 seconds after P2P startup,
-// on whatever tiny connection count exists at that instant - not because
-// enough real peers don't exist, but because nothing ever waited for them.
+// tier decision fires. Real observation: trigger_sync fires the first
+// bootstrap attempt only ~5-6 seconds after P2P startup, on whatever tiny
+// connection count exists at that instant - not because enough real peers
+// don't exist, but because nothing ever waited for them.
 // Only waits once per process lifetime - retries on later ticks proceed
 // immediately, since re-waiting on every ~4s retry would compound delay
 // for no benefit.

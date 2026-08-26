@@ -55,13 +55,13 @@ func (connection *Connection) bootstrap_fail(msg error) {
 	// bootstrap_chain() reassigns internally to a quorum-chosen peer and
 	// fans chunk-fetch out across still more peers, so by the time an
 	// error reaches here, `connection` is very often not who actually
-	// failed. Caught live: dropping it anyway produced a self-perpetuating
-	// cascade - each tick dropped an unrelated, healthy peer one step
-	// behind the real failure, which then got picked up as a fan-out peer
-	// on the next tick and failed immediately since it had just been
-	// closed. Whichever peer genuinely failed is dropped at its own point
-	// of failure inside bootstrap_chain(), where the real reference is
-	// still known - see the .exit() calls next to each TreeSection/manifest
+	// failed. Dropping it anyway produces a self-perpetuating cascade -
+	// each tick drops an unrelated, healthy peer one step behind the real
+	// failure, which then gets picked up as a fan-out peer on the next
+	// tick and fails immediately since it had just been closed. Whichever
+	// peer genuinely failed is dropped at its own point of failure inside
+	// bootstrap_chain(), where the real reference is still known - see the
+	// .exit() calls next to each TreeSection/manifest
 	// error return there.
 	connection.logger.Error(msg, "Bootstrap attempt failed - will retry with a different peer on the next tick")
 }
@@ -359,11 +359,10 @@ func (connection *Connection) bootstrap_chain() error {
 		round_robin := func(i int64) *Connection { return fanout_peers[i%int64(len(fanout_peers))] }
 
 		// pipeline the OUTER SC-meta chunk fetch too (same fire-ahead pattern
-		// as the balance tree above), fixing a real gap: this loop was left
-		// fully sequential (one blocking Client.Call per chunk) when the
-		// balance-tree loop and the nested per-SC fetches below were
-		// pipelined - caught live by watching a real bootstrap run, where
-		// step 2 was visibly slower per-unit than step 1.
+		// as the balance tree above): this loop was left fully sequential
+		// (one blocking Client.Call per chunk) when the balance-tree loop
+		// and the nested per-SC fetches below were pipelined, making step 2
+		// visibly slower per-unit than step 1.
 		//
 		// Deliberately a SEPARATE, SMALLER per-peer window than `pipeline`
 		// (capped at 4), not reusing it directly: each outer chunk here also
