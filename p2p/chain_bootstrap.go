@@ -205,6 +205,12 @@ func (connection *Connection) bootstrap_chain() error {
 				ts_response := res.call.Reply.(*Response_Tree_Section_Struct)
 				res.peer.logger.V(2).Info("served balance-tree chunk", "index", res.index)
 
+				{
+					var spot_section [8]byte
+					binary.BigEndian.PutUint64(spot_section[:], bits.Reverse64(uint64(res.index)))
+					bootstrap_spot_check_chunk(fanout_peers, res.peer, ts_response, config.BALANCE_TREE, request.TopoHeights[0], spot_section[:], uint64(path_length), fmt.Sprintf("balance-tree chunk %d", res.index))
+				}
+
 				// now we must write all the state changes to gravition
 				var balance_tree *graviton.Tree
 				if ss, err := chain.Store.Balance_store.LoadSnapshot(0); err != nil {
@@ -340,6 +346,12 @@ func (connection *Connection) bootstrap_chain() error {
 			ts_response := *res.call.Reply.(*Response_Tree_Section_Struct)
 			i := res.index
 			res.peer.logger.V(2).Info("served SC-meta chunk", "index", i)
+
+			{
+				var spot_section [8]byte
+				binary.BigEndian.PutUint64(spot_section[:], bits.Reverse64(uint64(i)))
+				bootstrap_spot_check_chunk(fanout_peers, res.peer, &ts_response, config.SC_META, request.TopoHeights[0], spot_section[:], uint64(path_length), fmt.Sprintf("SC-meta chunk %d", i))
+			}
 			{
 				// now we must write all the state changes to gravition
 				var changed_trees []*graviton.Tree

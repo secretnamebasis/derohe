@@ -31,14 +31,22 @@ package p2p
 //                                 peer trigger_sync already chose (today's
 //                                 unchanged behavior, the ultimate fallback).
 //
-// Scope: applied to the manifest call only. The three TreeSection
-// chunk-fetch phases (balance tree, SC-meta tree, per-SC data trees) still
-// fetch from a single peer post-manifest, same as before - per-chunk
-// quorum is real, well-scoped follow-up work, not attempted here.
+// The three TreeSection chunk-fetch phases (balance tree, SC-meta tree,
+// per-SC data trees) now fan out across the same eligible-peer pool too
+// (bootstrap_chunk_fanout_peers, wired into chain_bootstrap.go), instead of
+// fetching everything from the single manifest-quorum-chosen peer. Full
+// quorum on every chunk isn't attempted - it would multiply total network
+// requests by the quorum size across potentially thousands of chunks, far
+// more than the one-time manifest quorum costs. Instead, a random 1-in-N
+// sample of chunks is spot-checked against a second peer
+// (bootstrap_spot_check_chunk) - cheap, bounded overhead that can still
+// catch a peer serving bad data for a subset of chunks, without paying
+// full quorum cost on the whole state tree.
 
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -115,6 +123,78 @@ func bootstrap_chunk_fanout_peers(fallback *Connection, target int64) []*Connect
 		return []*Connection{fallback}
 	}
 	return eligible
+}
+
+// bootstrap_spot_check_sample_rate: 1-in-N chunks get re-checked against a
+// second peer. Bounded overhead proportional to sample rate, not total
+// chunk count - the whole point versus full per-chunk quorum.
+const bootstrap_spot_check_sample_rate = 10
+
+// hash_tree_section_response computes a canonical hash of a
+// Response_Tree_Section_Struct's meaningful content (Keys, Values, in
+// order) - same rationale as hash_changes_response: per-connection fields
+// aren't part of this. Two honest peers walking the same deterministic
+// tree section return keys in the same order (real tree traversal order,
+// not peer-specific), so this doesn't need to sort before hashing.
+func hash_tree_section_response(r *Response_Tree_Section_Struct) [32]byte {
+	h := sha256.New()
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(len(r.Keys)))
+	h.Write(buf[:])
+	for i := range r.Keys {
+		binary.BigEndian.PutUint64(buf[:], uint64(len(r.Keys[i])))
+		h.Write(buf[:])
+		h.Write(r.Keys[i])
+		binary.BigEndian.PutUint64(buf[:], uint64(len(r.Values[i])))
+		h.Write(buf[:])
+		h.Write(r.Values[i])
+	}
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out
+}
+
+// bootstrap_spot_check_chunk re-requests the same TreeSection query from a
+// different eligible peer than the one that originally answered, and logs
+// (does not reject or retry) if the two responses disagree. Runs in its
+// own goroutine, off the critical fetch/write path - a slow or failed
+// spot-check must never block or fail the real bootstrap. Only a random
+// 1-in-N sample is checked (bootstrap_spot_check_sample_rate), not every
+// chunk - see this file's header comment for why full per-chunk quorum
+// isn't attempted.
+func bootstrap_spot_check_chunk(peers []*Connection, answered_by *Connection, original *Response_Tree_Section_Struct, tree_name string, topo int64, section []byte, section_length uint64, chunk_desc string) {
+	if len(peers) < 2 {
+		return // no second peer to check against
+	}
+	if rand.Intn(bootstrap_spot_check_sample_rate) != 0 {
+		return // not sampled this time
+	}
+
+	var checker *Connection
+	for _, p := range peers {
+		if p != answered_by {
+			checker = p
+			break
+		}
+	}
+	if checker == nil {
+		return
+	}
+
+	go func() {
+		ts_request := Request_Tree_Section_Struct{Topo: topo, TreeName: []byte(tree_name), Section: section, SectionLength: section_length}
+		fill_common(&ts_request.Common)
+		var ts_response Response_Tree_Section_Struct
+		if err := checker.Client.Call("Peer.TreeSection", ts_request, &ts_response); err != nil {
+			logger.V(2).Info("bootstrap spot-check: re-fetch failed, skipping", "chunk", chunk_desc, "checker", checker.Addr.String(), "err", err)
+			return
+		}
+		if hash_tree_section_response(&ts_response) != hash_tree_section_response(original) {
+			logger.Error(nil, "bootstrap spot-check: DISAGREEMENT between peers for the same chunk", "chunk", chunk_desc, "answered_by", answered_by.Addr.String(), "checked_by", checker.Addr.String())
+			return
+		}
+		logger.V(3).Info("bootstrap spot-check: peers agree", "chunk", chunk_desc, "answered_by", answered_by.Addr.String(), "checked_by", checker.Addr.String())
+	}()
 }
 
 // is_trusted_peer checks whether a connection's address matches one of the
