@@ -125,60 +125,75 @@ func bootstrap_chunk_fanout_peers(fallback *Connection, target int64) []*Connect
 	return eligible
 }
 
-// bootstrap_known_dead_peers is a lightweight, phase-scoped, concurrency-safe
-// record of which fan-out peers have already been discovered dead during the
-// current phase (balance tree or SC-meta, including SC-meta's own nested
-// per-SC fetches, which share the same instance as their enclosing outer
-// loop). fanout_peers is a fixed snapshot taken once per phase and never
-// refreshed, so a peer that dies stays in that snapshot forever - without
-// this, each chunk that happens to select a since-died peer has to
-// independently rediscover it's dead via its own already_tried exclusion,
-// which is scoped to just that one chunk. Sharing the discovery across every
-// chunk in the phase turns repeated dead-peer rediscovery (observed live:
-// chains of 3-4+ dead-peer hops for a single stuck chunk) into a one-time
-// cost paid by whichever chunk finds it first.
-type bootstrap_known_dead_peers struct {
+// bootstrap_live_peer_pool tracks the actual currently-live subset of a
+// phase's fan-out peer pool (balance tree or SC-meta, including SC-meta's
+// own nested per-SC fetches, which share the same instance as their
+// enclosing outer loop), so peer selection stays genuinely even across
+// whoever remains alive.
+//
+// The earlier design (bootstrap_known_dead_peers) skipped known-dead peers
+// at lookup time but still probed forward through the ORIGINAL fixed
+// snapshot's array order - that doesn't redistribute a dead peer's share
+// evenly across survivors, it dumps it entirely onto whichever live peer
+// happens to sit next in array order after a run of dead ones. Confirmed
+// live: 61 percent of one phase's chunk traffic landing on a single peer,
+// with 6 other survivors splitting the rest. This type instead REMOVES a
+// peer from the live set once it's known dead, so picking evenly against
+// whatever remains is the same plain, uniform operation round-robin always
+// was - no probing, no positional bias, by construction.
+type bootstrap_live_peer_pool struct {
 	mu   sync.Mutex
-	dead map[string]bool
+	live []*Connection
 }
 
-func new_bootstrap_known_dead_peers() *bootstrap_known_dead_peers {
-	return &bootstrap_known_dead_peers{dead: map[string]bool{}}
+func new_bootstrap_live_peer_pool(peers []*Connection) *bootstrap_live_peer_pool {
+	live := make([]*Connection, len(peers))
+	copy(live, peers)
+	return &bootstrap_live_peer_pool{live: live}
 }
 
-func (k *bootstrap_known_dead_peers) mark(addr string) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	k.dead[addr] = true
+// pick returns a peer for index i, chosen evenly from whoever is currently
+// live. nil if every peer in the pool has been marked dead.
+func (p *bootstrap_live_peer_pool) pick(i int64) *Connection {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.live) == 0 {
+		return nil
+	}
+	return p.live[i%int64(len(p.live))]
 }
 
-func (k *bootstrap_known_dead_peers) is_dead(addr string) bool {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	return k.dead[addr]
-}
-
-// pick_alternate_chunk_peer returns the first eligible peer not yet tried
-// for a specific chunk and not already known dead for this phase, for
-// retrying a chunk-fetch failure against a different peer instead of
-// aborting the whole attempt. Unlike pick_alternate_connection
-// (sync_dispatch.go), this doesn't re-check Pruned/topoheight eligibility -
-// peers passed in are already filtered by bootstrap_eligible_peers, and
-// that filter doesn't change meaning between one chunk and the next the way
-// per-block Pruned eligibility does across a range of topoheights. Returns
-// nil once every eligible peer has been tried or is already known dead for
-// this chunk - the caller then genuinely gives up, rather than retrying
-// forever.
-func pick_alternate_chunk_peer(peers []*Connection, already_tried map[string]bool, known_dead *bootstrap_known_dead_peers) *Connection {
-	for _, p := range peers {
-		addr := p.Addr.String()
-		if already_tried[addr] {
-			continue
+// mark_dead removes a peer from the live set - swap-with-last, since
+// selection only needs uniformity, not order. Safe to call more than once
+// for the same peer (a no-op after the first removal).
+func (p *bootstrap_live_peer_pool) mark_dead(addr string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for idx, c := range p.live {
+		if c.Addr.String() == addr {
+			p.live[idx] = p.live[len(p.live)-1]
+			p.live = p.live[:len(p.live)-1]
+			return
 		}
-		if known_dead != nil && known_dead.is_dead(addr) {
-			continue
+	}
+}
+
+// pick_alternate returns a live peer not in already_tried, for retrying a
+// chunk-fetch failure against a different peer instead of aborting the
+// whole attempt. Unlike pick_alternate_connection (sync_dispatch.go), this
+// doesn't re-check Pruned/topoheight eligibility - peers in the pool are
+// already filtered by bootstrap_eligible_peers, and that filter doesn't
+// change meaning between one chunk and the next the way per-block Pruned
+// eligibility does across a range of topoheights. Returns nil once every
+// live peer has been tried for this chunk - the caller then genuinely
+// gives up, rather than retrying forever.
+func (p *bootstrap_live_peer_pool) pick_alternate(already_tried map[string]bool) *Connection {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, c := range p.live {
+		if !already_tried[c.Addr.String()] {
+			return c
 		}
-		return p
 	}
 	return nil
 }
