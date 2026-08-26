@@ -88,13 +88,13 @@ func (connection *Connection) bootstrap_chain() error {
 		request.TopoHeights = append(request.TopoHeights, topos[i])
 	}
 
-	// kata cycle 13: tiered trust-minimized manifest fetch (swarm quorum ->
-	// proportional quorum -> trusted peer -> today's original single-peer
-	// behavior as the ultimate fallback), instead of blindly trusting
-	// whichever single peer trigger_sync happened to pick. connection is
-	// reassigned to whichever peer was actually used, so the rest of this
-	// function's (unchanged) chunk-fetching uses a peer that's now proven
-	// to agree with the quorum, not an unverified single source.
+	// Tiered trust-minimized manifest fetch (swarm quorum -> proportional
+	// quorum -> trusted peer -> original single-peer behavior as the
+	// ultimate fallback), instead of blindly trusting whichever single peer
+	// trigger_sync happened to pick. connection is reassigned to whichever
+	// peer was actually used, so the rest of this function's (unchanged)
+	// chunk-fetching uses a peer that's now proven to agree with the
+	// quorum, not an unverified single source.
 	manifest, chosen_connection, ferr := fetch_bootstrap_manifest(connection, request)
 	if ferr != nil {
 		return ferr

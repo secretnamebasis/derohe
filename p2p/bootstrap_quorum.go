@@ -16,11 +16,11 @@
 
 package p2p
 
-// kata cycle 13: trust-minimized peer selection for fast-sync's bootstrap
-// manifest (Peer.ChangeSet). TreeSection is unable to prove a chunk was
-// answered honestly (unlike blocks, which self-verify via hash/PoW/parent
-// chain) - bootstrap_chain() previously trusted whichever single peer
-// answered outright. This replaces that with a three-tier confidence model:
+// Trust-minimized peer selection for fast-sync's bootstrap manifest
+// (Peer.ChangeSet). TreeSection is unable to prove a chunk was answered
+// honestly (unlike blocks, which self-verify via hash/PoW/parent chain) -
+// bootstrap_chain() previously trusted whichever single peer answered
+// outright. This replaces that with a three-tier confidence model:
 //
 //   Tier 1 (swarm quorum):       >15 eligible peers  -> need >=15 matching
 //   Tier 2 (proportional quorum): 3-15 eligible peers -> need >=ceil(33%)
@@ -31,10 +31,10 @@ package p2p
 //                                 peer trigger_sync already chose (today's
 //                                 unchanged behavior, the ultimate fallback).
 //
-// Scope for this cycle: applied to the manifest call only. The three
-// TreeSection chunk-fetch phases (balance tree, SC-meta tree, per-SC data
-// trees) still fetch from a single peer post-manifest, same as before -
-// per-chunk quorum is real, well-scoped follow-up work, not attempted here.
+// Scope: applied to the manifest call only. The three TreeSection
+// chunk-fetch phases (balance tree, SC-meta tree, per-SC data trees) still
+// fetch from a single peer post-manifest, same as before - per-chunk
+// quorum is real, well-scoped follow-up work, not attempted here.
 
 import (
 	"crypto/sha256"

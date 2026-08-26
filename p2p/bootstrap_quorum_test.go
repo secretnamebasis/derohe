@@ -24,7 +24,6 @@ import (
 	"github.com/deroproject/derohe/globals"
 )
 
-// kata cycle 13, test item 1: tier-boundary selection.
 func Test_Select_Bootstrap_Tier_Boundaries(t *testing.T) {
 	cases := []struct {
 		count          int
@@ -46,7 +45,6 @@ func Test_Select_Bootstrap_Tier_Boundaries(t *testing.T) {
 	}
 }
 
-// kata cycle 13, test item 1: quorum_fetch grouping/acceptance/rejection.
 func Test_Quorum_Fetch_Accepts_Majority_Rejects_Below_Threshold(t *testing.T) {
 	mk := func(port int) *Connection {
 		addr, _ := net.ResolveTCPAddr("tcp", fmt.Sprintf("127.0.0.1:%d", 20200+port))
@@ -82,7 +80,6 @@ func Test_Quorum_Fetch_Accepts_Majority_Rejects_Below_Threshold(t *testing.T) {
 	}
 }
 
-// kata cycle 13, test item 1: trusted-peer detection against real config data.
 func Test_Is_Trusted_Peer_Checks_Real_Priority_Node_List(t *testing.T) {
 	saved := globals.Arguments["--add-priority-node"]
 	defer func() { globals.Arguments["--add-priority-node"] = saved }()
