@@ -234,19 +234,66 @@ func (connection *Connection) bootstrap_chain() error {
 			path_length = 1
 		}
 
-		var section [8]byte
-
 		total_keys := 0
 
-		for i := state.Chunk; i < chunks; i++ {
-			state.Chunk = i
+		// pipeline the OUTER SC-meta chunk fetch too (same fire-ahead pattern
+		// as the balance tree above), fixing a real gap: this loop was left
+		// fully sequential (one blocking Client.Call per chunk) when the
+		// balance-tree loop and the nested per-SC fetches below were
+		// pipelined - caught live by watching a real bootstrap run, where
+		// step 2 was visibly slower per-unit than step 1.
+		//
+		// Deliberately a SEPARATE, SMALLER window than `pipeline` (capped at
+		// 4), not reusing it directly: each outer chunk here also spins up
+		// its own nested per-SC pipeline (up to `pipeline` concurrent
+		// requests) below. An unbounded outer window would compound against
+		// that nested one (outer x inner), not just add to it - the same
+		// compounding-concurrency risk this codebase's own torrent work
+		// flagged early on for a different pipeline entirely.
+		outer_pipeline := int64(pipeline)
+		if outer_pipeline > 4 {
+			outer_pipeline = 4
+		}
+
+		type sc_meta_indexed_result struct {
+			index int64
+			call  *rpc2.Call
+		}
+		sc_meta_results := make(chan sc_meta_indexed_result, outer_pipeline)
+
+		fire_sc_meta := func(i int64) {
+			var section [8]byte
 			binary.BigEndian.PutUint64(section[:], bits.Reverse64(uint64(i))) // place reverse path
-			ts_request := Request_Tree_Section_Struct{Topo: request.TopoHeights[0], TreeName: []byte(config.SC_META), Section: section[:], SectionLength: uint64(path_length)}
-			var ts_response Response_Tree_Section_Struct
+			ts_request := &Request_Tree_Section_Struct{Topo: request.TopoHeights[0], TreeName: []byte(config.SC_META), Section: section[:], SectionLength: uint64(path_length)}
 			fill_common(&ts_request.Common)
-			if err = connection.Client.Call("Peer.TreeSection", ts_request, &ts_response); err != nil {
-				return err
-			} else {
+			done := make(chan *rpc2.Call, 1)
+			call := connection.Client.Go("Peer.TreeSection", ts_request, &Response_Tree_Section_Struct{}, done)
+			go func() {
+				<-done
+				sc_meta_results <- sc_meta_indexed_result{index: i, call: call}
+			}()
+		}
+
+		next_fire := state.Chunk
+		inflight_count := int64(0)
+		for ; next_fire < chunks && inflight_count < outer_pipeline; next_fire++ {
+			fire_sc_meta(next_fire)
+			inflight_count++
+		}
+
+		completed := make(map[int64]bool)
+		low_water_mark := state.Chunk
+		total_to_do := chunks - state.Chunk
+
+		for done_count := int64(0); done_count < total_to_do; done_count++ {
+			res := <-sc_meta_results
+			inflight_count--
+			if res.call.Error != nil {
+				return res.call.Error
+			}
+			ts_response := *res.call.Reply.(*Response_Tree_Section_Struct)
+			i := res.index
+			{
 				// now we must write all the state changes to gravition
 				var changed_trees []*graviton.Tree
 				var sc_tree *graviton.Tree
@@ -377,7 +424,21 @@ func (connection *Connection) bootstrap_chain() error {
 				//rlog.Debugf("total SC keys %d hash %x err %s\n", total_keys, h, err)
 
 			}
+
+			completed[i] = true
+			for completed[low_water_mark] {
+				delete(completed, low_water_mark)
+				low_water_mark++
+			}
+			state.Chunk = low_water_mark
+
 			connection.logger.Info("Bootstrap in progress(step 2)", "percent", float32(i*100)/float32(chunks))
+
+			if next_fire < chunks {
+				fire_sc_meta(next_fire)
+				next_fire++
+				inflight_count++
+			}
 		}
 	}
 
