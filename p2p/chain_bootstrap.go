@@ -84,8 +84,6 @@ func (connection *Connection) bootstrap_chain() error {
 		topos = append(topos, i)
 	}
 
-	connection.logger.Info("Bootstrap Initiated")
-
 	for i := range topos {
 		request.TopoHeights = append(request.TopoHeights, topos[i])
 	}
@@ -103,7 +101,12 @@ func (connection *Connection) bootstrap_chain() error {
 	}
 	response = *manifest
 	connection = chosen_connection
-	// we have a response, see if its valid and try to add to get the blocks
+	// "Bootstrap Initiated" logs here, after the reassignment above, so it
+	// and every subsequent per-step log in this function share the same
+	// peer address - logging it before the reassignment made it look like
+	// two different peers were handling one bootstrap run, when it was
+	// really the same run continuing on the peer the quorum settled on.
+	connection.logger.Info("Bootstrap Initiated")
 	connection.logger.V(1).Info("changeset received (tiered manifest fetch)", "keycount", response.KeyCount, "sccount", response.SCKeyCount)
 
 	commit_version := uint64(0)
