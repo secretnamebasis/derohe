@@ -241,12 +241,24 @@ func (connection *Connection) bootstrap_chain() error {
 				//rlog.Debugf("total keys %d hash %x err %s\n", total_keys, h, err)
 
 				completed[res.index] = true
+				prev_water_mark := low_water_mark
 				for completed[low_water_mark] {
 					delete(completed, low_water_mark)
 					low_water_mark++
 				}
 				state.Chunk = low_water_mark
-				connection.logger.Info("Bootstrap in progress(step1)", "percent", float32(res.index*100)/float32(chunks))
+				// log the watermark (contiguous, resumable progress), not
+				// res.index (whichever chunk just happened to complete) -
+				// with chunks fanned across peers of differing latency,
+				// completion order jumps around a lot more than index order
+				// does, so res.index made the percent field visibly
+				// non-monotonic. Only log when the watermark actually moves,
+				// both to keep this meaningful and to avoid a log line per
+				// out-of-order completion that doesn't represent new
+				// resumable progress.
+				if low_water_mark != prev_water_mark {
+					connection.logger.Info("Bootstrap in progress(step1)", "percent", float32(low_water_mark*100)/float32(chunks))
+				}
 
 				if next_fire < chunks {
 					fire(next_fire)
@@ -492,13 +504,18 @@ func (connection *Connection) bootstrap_chain() error {
 			}
 
 			completed[i] = true
+			prev_water_mark := low_water_mark
 			for completed[low_water_mark] {
 				delete(completed, low_water_mark)
 				low_water_mark++
 			}
 			state.Chunk = low_water_mark
 
-			connection.logger.Info("Bootstrap in progress(step 2)", "percent", float32(i*100)/float32(chunks))
+			// same watermark-not-completion-index reasoning as step 1's log
+			// site - see the comment there.
+			if low_water_mark != prev_water_mark {
+				connection.logger.Info("Bootstrap in progress(step 2)", "percent", float32(low_water_mark*100)/float32(chunks))
+			}
 
 			if next_fire < chunks {
 				fire_sc_meta(next_fire)
