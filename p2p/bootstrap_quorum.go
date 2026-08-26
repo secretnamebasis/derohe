@@ -203,6 +203,21 @@ func (p *bootstrap_live_peer_pool) pick_alternate(already_tried map[string]bool)
 // chunk count - the whole point versus full per-chunk quorum.
 const bootstrap_spot_check_sample_rate = 10
 
+// bootstrap_chunk_request_timeout bounds how long a single TreeSection
+// request (balance tree, SC-meta outer, per-SC, per-SC continuation) waits
+// for a response before being treated as a failure and retried on a
+// different peer. Chosen from real observed data, not a guess: parsed
+// per-peer inter-completion gaps from a live run's console log (3868
+// events, 17 peers) - max observed legitimate gap was 9s, p99 2s, p95 1s,
+// median 0s. 30s is roughly 3x the worst observed legitimate gap, well
+// past typical, while still bounding a stall to a small fraction of the
+// multi-minute-plus hangs actually observed live without any timeout at
+// all. A peer that accepts a request but never responds (no error, no
+// close) previously blocked its result's drain loop forever - since
+// results are drained one at a time per chunk, that stalled the whole
+// phase, not just the one chunk.
+const bootstrap_chunk_request_timeout = 30 * time.Second
+
 // hash_tree_section_response computes a canonical hash of a
 // Response_Tree_Section_Struct's meaningful content (Keys, Values, in
 // order) - same rationale as hash_changes_response: per-connection fields

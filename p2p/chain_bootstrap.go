@@ -212,8 +212,20 @@ func (connection *Connection) bootstrap_chain() error {
 				done := make(chan *rpc2.Call, 1)
 				call := peer.Client.Go("Peer.TreeSection", ts_request, &Response_Tree_Section_Struct{}, done)
 				go func() {
-					<-done
-					results <- indexed_result{index: i, call: call, peer: peer}
+					// A peer that accepts the request but never responds
+					// (no error, no close) previously blocked this result
+					// forever - since results are drained one at a time,
+					// that stalled the whole phase, not just this chunk.
+					// If the real response does eventually arrive after a
+					// timeout, it lands in done's buffer (capacity 1) and
+					// is silently discarded - nothing reads it again, no
+					// goroutine leak.
+					select {
+					case <-done:
+						results <- indexed_result{index: i, call: call, peer: peer}
+					case <-time.After(bootstrap_chunk_request_timeout):
+						results <- indexed_result{index: i, call: &rpc2.Call{Error: fmt.Errorf("timed out after %s waiting for a response", bootstrap_chunk_request_timeout)}, peer: peer}
+					}
 				}()
 			}
 			// live_pool.pick can return nil if every peer in the pool has
