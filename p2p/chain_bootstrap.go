@@ -270,6 +270,14 @@ func (connection *Connection) bootstrap_chain() error {
 
 		total_keys := 0
 
+		// Fan the SC-meta chunk fetch across eligible peers too - same
+		// pattern as the balance tree above. Recomputed fresh here rather
+		// than reusing the balance tree's peer list: step 2 runs for
+		// several more minutes than step 1, long enough for the real peer
+		// pool to have changed since step 1 started.
+		fanout_peers := bootstrap_chunk_fanout_peers(connection, request.TopoHeights[0])
+		round_robin := func(i int64) *Connection { return fanout_peers[i%int64(len(fanout_peers))] }
+
 		// pipeline the OUTER SC-meta chunk fetch too (same fire-ahead pattern
 		// as the balance tree above), fixing a real gap: this loop was left
 		// fully sequential (one blocking Client.Call per chunk) when the
@@ -281,9 +289,11 @@ func (connection *Connection) bootstrap_chain() error {
 		// 4), not reusing it directly: each outer chunk here also spins up
 		// its own nested per-SC pipeline (up to `pipeline` concurrent
 		// requests) below. An unbounded outer window would compound against
-		// that nested one (outer x inner), not just add to it - the same
-		// compounding-concurrency risk this codebase's own torrent work
-		// flagged early on for a different pipeline entirely.
+		// that nested one (outer x inner), not just add to it. Now that both
+		// levels fan out across peers instead of concentrating on one, the
+		// per-peer load this cap was protecting against is lower than when
+		// this was written single-peer - left at 4 for now since retuning it
+		// needs its own real measurement, not a guess bundled into this change.
 		outer_pipeline := int64(pipeline)
 		if outer_pipeline > 4 {
 			outer_pipeline = 4
@@ -292,19 +302,21 @@ func (connection *Connection) bootstrap_chain() error {
 		type sc_meta_indexed_result struct {
 			index int64
 			call  *rpc2.Call
+			peer  *Connection
 		}
 		sc_meta_results := make(chan sc_meta_indexed_result, outer_pipeline)
 
 		fire_sc_meta := func(i int64) {
+			peer := round_robin(i)
 			var section [8]byte
 			binary.BigEndian.PutUint64(section[:], bits.Reverse64(uint64(i))) // place reverse path
 			ts_request := &Request_Tree_Section_Struct{Topo: request.TopoHeights[0], TreeName: []byte(config.SC_META), Section: section[:], SectionLength: uint64(path_length)}
 			fill_common(&ts_request.Common)
 			done := make(chan *rpc2.Call, 1)
-			call := connection.Client.Go("Peer.TreeSection", ts_request, &Response_Tree_Section_Struct{}, done)
+			call := peer.Client.Go("Peer.TreeSection", ts_request, &Response_Tree_Section_Struct{}, done)
 			go func() {
 				<-done
-				sc_meta_results <- sc_meta_indexed_result{index: i, call: call}
+				sc_meta_results <- sc_meta_indexed_result{index: i, call: call, peer: peer}
 			}()
 		}
 
@@ -323,10 +335,11 @@ func (connection *Connection) bootstrap_chain() error {
 			res := <-sc_meta_results
 			inflight_count--
 			if res.call.Error != nil {
-				return res.call.Error
+				return fmt.Errorf("SC-meta chunk %d fetch from %s: %w", res.index, res.peer.Addr.String(), res.call.Error)
 			}
 			ts_response := *res.call.Reply.(*Response_Tree_Section_Struct)
 			i := res.index
+			res.peer.logger.V(2).Info("served SC-meta chunk", "index", i)
 			{
 				// now we must write all the state changes to gravition
 				var changed_trees []*graviton.Tree
@@ -360,16 +373,22 @@ func (connection *Connection) bootstrap_chain() error {
 					err          error
 				}
 
-				fetch_one_sc := func(key []byte) sc_fetch_result {
+				// idx picks the peer (round_robin, same pool as the outer
+				// SC-meta fetch) - one peer per whole SC, including any of
+				// its own continuation chunks below, rather than fanning out
+				// a fourth concurrency level within a single SC's own tree.
+				fetch_one_sc := func(idx int, key []byte) sc_fetch_result {
+					peer := round_robin(int64(idx))
 					var section [8]byte
 					sc_request := Request_Tree_Section_Struct{Topo: request.TopoHeights[0], TreeName: key, Section: section[:], SectionLength: uint64(0)}
 					var sc_response Response_Tree_Section_Struct
 					fill_common(&sc_request.Common)
-					if err := connection.Client.Call("Peer.TreeSection", sc_request, &sc_response); err != nil {
-						return sc_fetch_result{key: key, err: err}
+					if err := peer.Client.Call("Peer.TreeSection", sc_request, &sc_response); err != nil {
+						return sc_fetch_result{key: key, err: fmt.Errorf("SC data-tree fetch from %s: %w", peer.Addr.String(), err)}
 					}
 
 					if sc_response.KeyCount < 4096 {
+						peer.logger.V(3).Info("served SC data-tree fetch", "key", fmt.Sprintf("%x", key))
 						return sc_fetch_result{key: key, keys: sc_response.Keys, values: sc_response.Values}
 					}
 
@@ -397,8 +416,8 @@ func (connection *Connection) bootstrap_chain() error {
 						sc_ts_request := Request_Tree_Section_Struct{Topo: request.TopoHeights[0], TreeName: key, Section: sc_section[:], SectionLength: uint64(sc_path_length)}
 						var sc_ts_response Response_Tree_Section_Struct
 						fill_common(&sc_ts_request.Common)
-						if err := connection.Client.Call("Peer.TreeSection", sc_ts_request, &sc_ts_response); err != nil {
-							return sc_fetch_result{key: key, err: err}
+						if err := peer.Client.Call("Peer.TreeSection", sc_ts_request, &sc_ts_response); err != nil {
+							return sc_fetch_result{key: key, err: fmt.Errorf("SC data-tree continuation fetch from %s: %w", peer.Addr.String(), err)}
 						}
 						if len(sc_ts_response.Keys) != len(sc_ts_response.Values) {
 							return sc_fetch_result{key: key, err: fmt.Errorf("mismatched key and value count")}
@@ -406,12 +425,13 @@ func (connection *Connection) bootstrap_chain() error {
 						all_keys = append(all_keys, sc_ts_response.Keys...)
 						all_values = append(all_values, sc_ts_response.Values...)
 					}
+					peer.logger.V(3).Info("served SC data-tree fetch", "key", fmt.Sprintf("%x", key))
 					return sc_fetch_result{key: key, keys: all_keys, values: all_values}
 				}
 
 				sc_results := make(chan sc_fetch_result, pipeline)
 				launch := func(idx int) {
-					go func() { sc_results <- fetch_one_sc(ts_response.Keys[idx]) }()
+					go func() { sc_results <- fetch_one_sc(idx, ts_response.Keys[idx]) }()
 				}
 
 				sc_next := 0
