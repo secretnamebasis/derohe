@@ -170,12 +170,29 @@ func (connection *Connection) bootstrap_chain() error {
 			fanout_peers := bootstrap_chunk_fanout_peers(connection, request.TopoHeights[0])
 			round_robin := func(i int64) *Connection { return fanout_peers[i%int64(len(fanout_peers))] }
 
+			// Scale the in-flight request budget with the number of fan-out
+			// peers, not one fixed window shared across all of them.
+			// `pipeline` alone is sized for a single peer's optimal
+			// concurrency (GOMAXPROCS-based) - dividing that same window
+			// across N peers via round-robin meant each peer only had
+			// ~1/N requests in flight on average, which isn't torrent-like
+			// fan-out, just a small window spread thin. Confirmed live: with
+			// the shared window of 16 spread across ~30 real peers, the
+			// resumable watermark advanced roughly 20x slower than
+			// pipelining that same 16 to a single peer. Each fan-out peer
+			// now gets its own full `pipeline`-sized window instead - the
+			// round-robin assignment below already cycles evenly through
+			// all N peers, so firing total_pipeline requests ahead gives
+			// each peer ~pipeline of them, same per-peer concurrency this
+			// was already proven safe at, just no longer divided.
+			total_pipeline := int64(pipeline) * int64(len(fanout_peers))
+
 			type indexed_result struct {
 				index int64
 				call  *rpc2.Call
 				peer  *Connection
 			}
-			results := make(chan indexed_result, pipeline)
+			results := make(chan indexed_result, total_pipeline)
 
 			fire := func(i int64) {
 				peer := round_robin(i)
@@ -193,8 +210,7 @@ func (connection *Connection) bootstrap_chain() error {
 
 			next_fire := state.Chunk
 			inflight_count := int64(0)
-			tx_pipeline := int64(pipeline)
-			for ; next_fire < chunks && inflight_count < tx_pipeline; next_fire++ {
+			for ; next_fire < chunks && inflight_count < total_pipeline; next_fire++ {
 				fire(next_fire)
 				inflight_count++
 			}
@@ -317,19 +333,23 @@ func (connection *Connection) bootstrap_chain() error {
 		// pipelined - caught live by watching a real bootstrap run, where
 		// step 2 was visibly slower per-unit than step 1.
 		//
-		// Deliberately a SEPARATE, SMALLER window than `pipeline` (capped at
-		// 4), not reusing it directly: each outer chunk here also spins up
-		// its own nested per-SC pipeline (up to `pipeline` concurrent
-		// requests) below. An unbounded outer window would compound against
-		// that nested one (outer x inner), not just add to it. Now that both
-		// levels fan out across peers instead of concentrating on one, the
-		// per-peer load this cap was protecting against is lower than when
-		// this was written single-peer - left at 4 for now since retuning it
-		// needs its own real measurement, not a guess bundled into this change.
-		outer_pipeline := int64(pipeline)
-		if outer_pipeline > 4 {
-			outer_pipeline = 4
+		// Deliberately a SEPARATE, SMALLER per-peer window than `pipeline`
+		// (capped at 4), not reusing it directly: each outer chunk here also
+		// spins up its own nested per-SC pipeline (up to `pipeline`
+		// concurrent requests) below. An unbounded per-peer outer window
+		// would compound against that nested one (outer x inner) on
+		// whichever peer answers both. Scaled by peer count for the same
+		// torrent-like reason as the balance tree above - each fan-out peer
+		// keeps its own bounded share (4) rather than the total staying
+		// fixed regardless of how many peers are available - but the
+		// PER-PEER cap itself stays at 4, not `pipeline`, so the
+		// compounding risk this was written to avoid doesn't come back in
+		// fan-out form.
+		outer_pipeline_per_peer := int64(pipeline)
+		if outer_pipeline_per_peer > 4 {
+			outer_pipeline_per_peer = 4
 		}
+		outer_pipeline := outer_pipeline_per_peer * int64(len(fanout_peers))
 
 		type sc_meta_indexed_result struct {
 			index int64
