@@ -403,6 +403,12 @@ func fetch_bootstrap_manifest(fallback_connection *Connection, request ChangeLis
 	r := request
 	fill_common(&r.Common)
 	if err := fallback_connection.Client.Call("Peer.ChangeSet", r, &response); err != nil {
+		// this is the one manifest-fetch error that reaches bootstrap_fail
+		// (quorum-tier and trusted-peer failures fall through to the next
+		// option instead of returning an error) - drop the specific peer
+		// that actually failed here, at the point where it's still known,
+		// rather than leaving it to the caller's now-stale connection.
+		fallback_connection.exit()
 		return nil, nil, err
 	}
 	return &response, fallback_connection, nil

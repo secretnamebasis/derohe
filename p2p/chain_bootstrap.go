@@ -50,13 +50,20 @@ type sync_progress struct {
 var state sync_progress
 
 func (connection *Connection) bootstrap_fail(msg error) {
-	// this only drops the ONE peer connection that errored (network hiccup,
-	// dropped socket, etc) - real progress already committed to disk is
-	// untouched, and trigger_sync will retry bootstrap with a different
-	// peer on its next tick. Worded to say so plainly rather than reading
-	// as a fatal/critical failure of the whole bootstrap process.
-	connection.logger.Error(msg, "Bootstrap chunk fetch failed for this peer - dropping this connection, will retry with a different peer")
-	connection.exit()
+	// Does NOT drop `connection` here - `connection` is whichever peer
+	// trigger_sync originally called bootstrap_chain() on, but
+	// bootstrap_chain() reassigns internally to a quorum-chosen peer and
+	// fans chunk-fetch out across still more peers, so by the time an
+	// error reaches here, `connection` is very often not who actually
+	// failed. Caught live: dropping it anyway produced a self-perpetuating
+	// cascade - each tick dropped an unrelated, healthy peer one step
+	// behind the real failure, which then got picked up as a fan-out peer
+	// on the next tick and failed immediately since it had just been
+	// closed. Whichever peer genuinely failed is dropped at its own point
+	// of failure inside bootstrap_chain(), where the real reference is
+	// still known - see the .exit() calls next to each TreeSection/manifest
+	// error return there.
+	connection.logger.Error(msg, "Bootstrap attempt failed - will retry with a different peer on the next tick")
 }
 
 func (connection *Connection) bootstrap_chain() error {
@@ -200,6 +207,12 @@ func (connection *Connection) bootstrap_chain() error {
 				res := <-results
 				inflight_count--
 				if res.call.Error != nil {
+					// drop the peer that actually failed, right here where
+					// the real reference is known - bootstrap_fail() no
+					// longer does this on the caller's behalf, since its own
+					// connection is very often a different, unrelated peer
+					// once chunks are fanned out across many.
+					res.peer.exit()
 					return fmt.Errorf("balance-tree chunk %d fetch from %s: %w", res.index, res.peer.Addr.String(), res.call.Error)
 				}
 				ts_response := res.call.Reply.(*Response_Tree_Section_Struct)
@@ -221,6 +234,7 @@ func (connection *Connection) bootstrap_chain() error {
 
 				if len(ts_response.Keys) != len(ts_response.Values) {
 					//rlog.Warnf("Incoming Key count %d value count %d \"%s\" ", len(ts_response.Keys), len(ts_response.Values), globals.CTXString(connection.logger))
+					res.peer.exit()
 					return fmt.Errorf("mismatched key and value count")
 				}
 				//rlog.Debugf("chunk %d Will write %d keys\n", res.index, len(ts_response.Keys))
@@ -353,6 +367,7 @@ func (connection *Connection) bootstrap_chain() error {
 			res := <-sc_meta_results
 			inflight_count--
 			if res.call.Error != nil {
+				res.peer.exit()
 				return fmt.Errorf("SC-meta chunk %d fetch from %s: %w", res.index, res.peer.Addr.String(), res.call.Error)
 			}
 			ts_response := *res.call.Reply.(*Response_Tree_Section_Struct)
@@ -378,6 +393,7 @@ func (connection *Connection) bootstrap_chain() error {
 
 				if len(ts_response.Keys) != len(ts_response.Values) {
 					//rlog.Warnf("Incoming Key count %d value count %d \"%s\" ", len(ts_response.Keys), len(ts_response.Values), globals.CTXString(connection.logger))
+					res.peer.exit()
 					return fmt.Errorf("mismatched key and value count")
 				}
 				//rlog.Debugf("SC chunk %d Will write %d keys\n", i, len(ts_response.Keys))
@@ -408,6 +424,7 @@ func (connection *Connection) bootstrap_chain() error {
 					var sc_response Response_Tree_Section_Struct
 					fill_common(&sc_request.Common)
 					if err := peer.Client.Call("Peer.TreeSection", sc_request, &sc_response); err != nil {
+						peer.exit()
 						return sc_fetch_result{key: key, err: fmt.Errorf("SC data-tree fetch from %s: %w", peer.Addr.String(), err)}
 					}
 
@@ -441,9 +458,11 @@ func (connection *Connection) bootstrap_chain() error {
 						var sc_ts_response Response_Tree_Section_Struct
 						fill_common(&sc_ts_request.Common)
 						if err := peer.Client.Call("Peer.TreeSection", sc_ts_request, &sc_ts_response); err != nil {
+							peer.exit()
 							return sc_fetch_result{key: key, err: fmt.Errorf("SC data-tree continuation fetch from %s: %w", peer.Addr.String(), err)}
 						}
 						if len(sc_ts_response.Keys) != len(sc_ts_response.Values) {
+							peer.exit()
 							return sc_fetch_result{key: key, err: fmt.Errorf("mismatched key and value count")}
 						}
 						all_keys = append(all_keys, sc_ts_response.Keys...)
