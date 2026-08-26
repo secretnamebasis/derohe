@@ -237,19 +237,16 @@ func (connection *Connection) bootstrap_chain() error {
 		total_keys := 0
 
 		// pipeline the OUTER SC-meta chunk fetch too (same fire-ahead pattern
-		// as the balance tree above), fixing a real gap: this loop was left
-		// fully sequential (one blocking Client.Call per chunk) when the
-		// balance-tree loop and the nested per-SC fetches below were
-		// pipelined - caught live by watching a real bootstrap run, where
-		// step 2 was visibly slower per-unit than step 1.
+		// as the balance tree above): this loop was left fully sequential
+		// (one blocking Client.Call per chunk) when the balance-tree loop
+		// and the nested per-SC fetches below were pipelined, making step 2
+		// visibly slower per-unit than step 1.
 		//
 		// Deliberately a SEPARATE, SMALLER window than `pipeline` (capped at
 		// 4), not reusing it directly: each outer chunk here also spins up
 		// its own nested per-SC pipeline (up to `pipeline` concurrent
 		// requests) below. An unbounded outer window would compound against
-		// that nested one (outer x inner), not just add to it - the same
-		// compounding-concurrency risk this codebase's own torrent work
-		// flagged early on for a different pipeline entirely.
+		// that nested one (outer x inner), not just add to it.
 		outer_pipeline := int64(pipeline)
 		if outer_pipeline > 4 {
 			outer_pipeline = 4
