@@ -125,6 +125,25 @@ func bootstrap_chunk_fanout_peers(fallback *Connection, target int64) []*Connect
 	return eligible
 }
 
+// pick_alternate_chunk_peer returns the first eligible peer not yet tried
+// for a specific chunk, for retrying a chunk-fetch failure against a
+// different peer instead of aborting the whole attempt. Unlike
+// pick_alternate_connection (sync_dispatch.go), this doesn't re-check
+// Pruned/topoheight eligibility - peers passed in are already filtered by
+// bootstrap_eligible_peers, and that filter doesn't change meaning between
+// one chunk and the next the way per-block Pruned eligibility does across a
+// range of topoheights. Returns nil once every eligible peer has been tried
+// for this chunk - the caller then genuinely gives up, rather than retrying
+// forever.
+func pick_alternate_chunk_peer(peers []*Connection, already_tried map[string]bool) *Connection {
+	for _, p := range peers {
+		if !already_tried[p.Addr.String()] {
+			return p
+		}
+	}
+	return nil
+}
+
 // bootstrap_spot_check_sample_rate: 1-in-N chunks get re-checked against a
 // second peer. Bounded overhead proportional to sample rate, not total
 // chunk count - the whole point versus full per-chunk quorum.

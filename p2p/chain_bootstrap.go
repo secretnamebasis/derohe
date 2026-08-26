@@ -194,8 +194,7 @@ func (connection *Connection) bootstrap_chain() error {
 			}
 			results := make(chan indexed_result, total_pipeline)
 
-			fire := func(i int64) {
-				peer := round_robin(i)
+			do_fire := func(i int64, peer *Connection) {
 				var section [8]byte
 				binary.BigEndian.PutUint64(section[:], bits.Reverse64(uint64(i))) // place reverse path
 				ts_request := &Request_Tree_Section_Struct{Topo: request.TopoHeights[0], TreeName: []byte(config.BALANCE_TREE), Section: section[:], SectionLength: uint64(path_length)}
@@ -207,6 +206,7 @@ func (connection *Connection) bootstrap_chain() error {
 					results <- indexed_result{index: i, call: call, peer: peer}
 				}()
 			}
+			fire := func(i int64) { do_fire(i, round_robin(i)) }
 
 			next_fire := state.Chunk
 			inflight_count := int64(0)
@@ -215,21 +215,49 @@ func (connection *Connection) bootstrap_chain() error {
 				inflight_count++
 			}
 
+			// On a chunk-fetch failure, retry that SAME chunk against a
+			// different eligible peer instead of aborting the whole
+			// attempt - one flaky peer among many fan-out peers used to
+			// kill the entire bootstrap run, and at the concurrency levels
+			// fan-out now runs at, at least one request failing at any
+			// given moment is close to certain (confirmed live: dozens of
+			// closed-pipe/timeout errors per minute against ~30 real
+			// peers). already_tried is keyed per chunk index, not global,
+			// so a peer that failed one chunk can still serve others.
+			// Retrying re-fires into the very in-flight slot the failure
+			// vacated - inflight_count nets to unchanged, no extra budget
+			// needed. Only once every eligible peer has been tried for a
+			// specific chunk does this give up and abort the attempt, same
+			// as before, just now the rare last resort instead of the
+			// first failure.
+			already_tried := map[int64]map[string]bool{}
+			retry_or_give_up := func(idx int64, failed_peer *Connection, cause error) (retried bool, err error) {
+				failed_peer.exit()
+				if already_tried[idx] == nil {
+					already_tried[idx] = map[string]bool{}
+				}
+				already_tried[idx][failed_peer.Addr.String()] = true
+				if alt := pick_alternate_chunk_peer(fanout_peers, already_tried[idx]); alt != nil {
+					do_fire(idx, alt)
+					inflight_count++
+					return true, nil
+				}
+				return false, fmt.Errorf("balance-tree chunk %d exhausted all eligible peers: %w", idx, cause)
+			}
+
 			completed := make(map[int64]bool)
 			low_water_mark := state.Chunk
 			total_to_do := chunks - state.Chunk
 
-			for done_count := int64(0); done_count < total_to_do; done_count++ {
+			for done_count := int64(0); done_count < total_to_do; {
 				res := <-results
 				inflight_count--
 				if res.call.Error != nil {
-					// drop the peer that actually failed, right here where
-					// the real reference is known - bootstrap_fail() no
-					// longer does this on the caller's behalf, since its own
-					// connection is very often a different, unrelated peer
-					// once chunks are fanned out across many.
-					res.peer.exit()
-					return fmt.Errorf("balance-tree chunk %d fetch from %s: %w", res.index, res.peer.Addr.String(), res.call.Error)
+					if retried, giveup_err := retry_or_give_up(res.index, res.peer, res.call.Error); retried {
+						continue
+					} else {
+						return giveup_err
+					}
 				}
 				ts_response := res.call.Reply.(*Response_Tree_Section_Struct)
 				res.peer.logger.V(2).Info("served balance-tree chunk", "index", res.index)
@@ -250,8 +278,11 @@ func (connection *Connection) bootstrap_chain() error {
 
 				if len(ts_response.Keys) != len(ts_response.Values) {
 					//rlog.Warnf("Incoming Key count %d value count %d \"%s\" ", len(ts_response.Keys), len(ts_response.Values), globals.CTXString(connection.logger))
-					res.peer.exit()
-					return fmt.Errorf("mismatched key and value count")
+					if retried, giveup_err := retry_or_give_up(res.index, res.peer, fmt.Errorf("mismatched key and value count")); retried {
+						continue
+					} else {
+						return giveup_err
+					}
 				}
 				//rlog.Debugf("chunk %d Will write %d keys\n", res.index, len(ts_response.Keys))
 
@@ -289,6 +320,7 @@ func (connection *Connection) bootstrap_chain() error {
 				if low_water_mark != prev_water_mark {
 					connection.logger.Info("Bootstrap in progress(step1)", "percent", float32(low_water_mark*100)/float32(chunks))
 				}
+				done_count++
 
 				if next_fire < chunks {
 					fire(next_fire)
