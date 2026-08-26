@@ -48,7 +48,12 @@ type sync_progress struct {
 var state sync_progress
 
 func (connection *Connection) bootstrap_fail(msg error) {
-	connection.logger.Error(msg, "Bootstrap failed")
+	// this only drops the ONE peer connection that errored (network hiccup,
+	// dropped socket, etc) - real progress already committed to disk is
+	// untouched, and trigger_sync will retry bootstrap with a different
+	// peer on its next tick. Worded to say so plainly rather than reading
+	// as a fatal/critical failure of the whole bootstrap process.
+	connection.logger.Error(msg, "Bootstrap chunk fetch failed for this peer - dropping this connection, will retry with a different peer")
 	connection.exit()
 }
 
@@ -85,12 +90,21 @@ func (connection *Connection) bootstrap_chain() error {
 		request.TopoHeights = append(request.TopoHeights, topos[i])
 	}
 
-	fill_common(&request.Common) // fill common info
-	if err = connection.Client.Call("Peer.ChangeSet", request, &response); err != nil {
-		return err
+	// kata cycle 13: tiered trust-minimized manifest fetch (swarm quorum ->
+	// proportional quorum -> trusted peer -> today's original single-peer
+	// behavior as the ultimate fallback), instead of blindly trusting
+	// whichever single peer trigger_sync happened to pick. connection is
+	// reassigned to whichever peer was actually used, so the rest of this
+	// function's (unchanged) chunk-fetching uses a peer that's now proven
+	// to agree with the quorum, not an unverified single source.
+	manifest, chosen_connection, ferr := fetch_bootstrap_manifest(connection, request)
+	if ferr != nil {
+		return ferr
 	}
+	response = *manifest
+	connection = chosen_connection
 	// we have a response, see if its valid and try to add to get the blocks
-	connection.logger.V(1).Info("changeset received", "keycount", response.KeyCount, "sccount", response.SCKeyCount)
+	connection.logger.V(1).Info("changeset received (tiered manifest fetch)", "keycount", response.KeyCount, "sccount", response.SCKeyCount)
 
 	commit_version := uint64(0)
 
