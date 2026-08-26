@@ -48,13 +48,18 @@ type sync_progress struct {
 var state sync_progress
 
 func (connection *Connection) bootstrap_fail(msg error) {
-	// this only drops the ONE peer connection that errored (network hiccup,
-	// dropped socket, etc) - real progress already committed to disk is
-	// untouched, and trigger_sync will retry bootstrap with a different
-	// peer on its next tick. Worded to say so plainly rather than reading
-	// as a fatal/critical failure of the whole bootstrap process.
-	connection.logger.Error(msg, "Bootstrap chunk fetch failed for this peer - dropping this connection, will retry with a different peer")
-	connection.exit()
+	// Does NOT drop `connection` here - `connection` is whichever peer
+	// trigger_sync originally called bootstrap_chain() on, but
+	// bootstrap_chain() reassigns internally to whichever peer the manifest
+	// quorum settled on, which is very often a different peer. By the time
+	// an error reaches here (from chunk-fetching against that reassigned
+	// peer), `connection` no longer refers to who actually failed - dropping
+	// it anyway would disconnect an unrelated, healthy peer instead of the
+	// real offender. Whichever peer genuinely failed is dropped at its own
+	// point of failure inside bootstrap_chain(), where the real reference
+	// is still known - see the .exit() calls next to each TreeSection/
+	// manifest error return there.
+	connection.logger.Error(msg, "Bootstrap attempt failed - will retry with a different peer on the next tick")
 }
 
 func (connection *Connection) bootstrap_chain() error {
@@ -139,6 +144,7 @@ func (connection *Connection) bootstrap_chain() error {
 				var ts_response Response_Tree_Section_Struct
 				fill_common(&ts_request.Common)
 				if err = connection.Client.Call("Peer.TreeSection", ts_request, &ts_response); err != nil {
+					connection.exit()
 					return err
 				} else {
 					// now we must write all the state changes to gravition
@@ -151,6 +157,7 @@ func (connection *Connection) bootstrap_chain() error {
 
 					if len(ts_response.Keys) != len(ts_response.Values) {
 						//rlog.Warnf("Incoming Key count %d value count %d \"%s\" ", len(ts_response.Keys), len(ts_response.Values), globals.CTXString(connection.logger))
+						connection.exit()
 						return fmt.Errorf("mismatched key and value count")
 					}
 					//rlog.Debugf("chunk %d Will write %d keys\n", i, len(ts_response.Keys))
@@ -204,6 +211,7 @@ func (connection *Connection) bootstrap_chain() error {
 			var ts_response Response_Tree_Section_Struct
 			fill_common(&ts_request.Common)
 			if err = connection.Client.Call("Peer.TreeSection", ts_request, &ts_response); err != nil {
+				connection.exit()
 				return err
 			} else {
 				// now we must write all the state changes to gravition
@@ -219,6 +227,7 @@ func (connection *Connection) bootstrap_chain() error {
 
 				if len(ts_response.Keys) != len(ts_response.Values) {
 					//rlog.Warnf("Incoming Key count %d value count %d \"%s\" ", len(ts_response.Keys), len(ts_response.Values), globals.CTXString(connection.logger))
+					connection.exit()
 					return fmt.Errorf("mismatched key and value count")
 				}
 				//rlog.Debugf("SC chunk %d Will write %d keys\n", i, len(ts_response.Keys))
@@ -232,6 +241,7 @@ func (connection *Connection) bootstrap_chain() error {
 					var sc_response Response_Tree_Section_Struct
 					fill_common(&sc_request.Common)
 					if err = connection.Client.Call("Peer.TreeSection", sc_request, &sc_response); err != nil {
+						connection.exit()
 						return err
 					} else {
 
@@ -263,10 +273,12 @@ func (connection *Connection) bootstrap_chain() error {
 								var sc_ts_response Response_Tree_Section_Struct
 								fill_common(&sc_ts_request.Common)
 								if err = connection.Client.Call("Peer.TreeSection", sc_ts_request, &sc_ts_response); err != nil {
+									connection.exit()
 									return err
 								} else { // request was successfull
 
 									if len(sc_ts_response.Keys) != len(sc_ts_response.Values) {
+										connection.exit()
 										return fmt.Errorf("mismatched key and value count")
 									}
 									//fmt.Printf("writing SC chunk %d/%d (%d)  writing %d keys %x\n", k, sc_chunks, sc_response.KeyCount, len(sc_ts_response.Keys), ts_response.Keys[j])
