@@ -46,6 +46,8 @@ package p2p
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -142,8 +144,9 @@ func bootstrap_chunk_fanout_peers(fallback *Connection, target int64) []*Connect
 // whatever remains is the same plain, uniform operation round-robin always
 // was - no probing, no positional bias, by construction.
 type bootstrap_live_peer_pool struct {
-	mu   sync.Mutex
-	live []*Connection
+	mu             sync.Mutex
+	live           []*Connection
+	timeout_counts map[string]int // addr -> bare-timeout count this phase, see handle_failure
 }
 
 func new_bootstrap_live_peer_pool(peers []*Connection) *bootstrap_live_peer_pool {
@@ -165,17 +168,21 @@ func (p *bootstrap_live_peer_pool) pick(i int64) *Connection {
 
 // mark_dead removes a peer from the live set - swap-with-last, since
 // selection only needs uniformity, not order. Safe to call more than once
-// for the same peer (a no-op after the first removal).
-func (p *bootstrap_live_peer_pool) mark_dead(addr string) {
+// for the same peer (a no-op after the first removal) - returns whether
+// this call actually performed the removal, so a caller logging the event
+// can tell a real first-time drop from a redundant later call against a
+// peer that's already gone.
+func (p *bootstrap_live_peer_pool) mark_dead(addr string) (removed bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for idx, c := range p.live {
 		if c.Addr.String() == addr {
 			p.live[idx] = p.live[len(p.live)-1]
 			p.live = p.live[:len(p.live)-1]
-			return
+			return true
 		}
 	}
+	return false
 }
 
 // pick_alternate returns a live peer not in already_tried, for retrying a
@@ -196,6 +203,64 @@ func (p *bootstrap_live_peer_pool) pick_alternate(already_tried map[string]bool)
 		}
 	}
 	return nil
+}
+
+// bootstrap_peer_timeout_drop_threshold: a peer that never produces a real
+// connection-level error but keeps hitting bootstrap_chunk_request_timeout
+// anyway is still eventually treated as dead - a chronically overloaded or
+// throttling peer shouldn't stay in the live pool forever just because it
+// never technically errors. One bare timeout, on its own, is deliberately
+// NOT enough (see handle_failure's own comment).
+const bootstrap_peer_timeout_drop_threshold = 3
+
+// errBootstrapChunkTimeout marks a chunk-fetch failure as our own
+// synthesized timeout (bootstrap_chunk_request_timeout elapsed with no
+// response), as opposed to a real error the connection itself reported.
+// Wrapped with %w at each site that produces it, so handle_failure can
+// recognize it through errors.Is regardless of how much additional context
+// gets layered on around it (e.g. attempt_fetch_sc's "SC data-tree fetch
+// from %s: %w").
+var errBootstrapChunkTimeout = errors.New("timed out waiting for a response")
+
+// handle_failure decides whether a chunk-fetch failure against failed_peer
+// should take the peer out of the live pool entirely, or just cost it this
+// one chunk. rpc2.Client multiplexes many concurrent requests over one
+// connection, and our fan-out fires dozens of chunk requests to the same
+// peer at once - a bare timeout on ONE of those doesn't mean the peer is
+// dead, just that one particular request was slow (confirmed live: a peer
+// logged a chunk timeout and a successful fetch in the same second). Only a
+// genuine connection-level error (closed pipe, reset, shut down - the
+// connection itself reporting it's broken) drops the peer immediately.
+// Repeated bare timeouts against the same peer still drop it eventually
+// (bootstrap_peer_timeout_drop_threshold), since a peer that's chronically
+// slow rather than momentarily busy needs the same treatment a hard error
+// would get.
+func (p *bootstrap_live_peer_pool) handle_failure(failed_peer *Connection, cause error) (dropped bool, reason string) {
+	addr := failed_peer.Addr.String()
+	if errors.Is(cause, errBootstrapChunkTimeout) {
+		p.mu.Lock()
+		if p.timeout_counts == nil {
+			p.timeout_counts = map[string]int{}
+		}
+		p.timeout_counts[addr]++
+		count := p.timeout_counts[addr]
+		p.mu.Unlock()
+		if count < bootstrap_peer_timeout_drop_threshold {
+			return false, ""
+		}
+		reason = fmt.Sprintf("timed out %d times", count)
+	} else {
+		reason = cause.Error()
+	}
+	failed_peer.exit()
+	// mark_dead's own return, not an unconditional true, is what decides
+	// dropped here: our fan-out fires many concurrent requests per peer, so
+	// a connection that actually dies produces a burst of near-simultaneous
+	// failures against it, each reaching handle_failure independently -
+	// live-caught: 2061 log lines for only 18 real drops before this fix.
+	// Only the call that actually performs the removal should be reported
+	// as a drop; every later one against an already-gone peer is a no-op.
+	return p.mark_dead(addr), reason
 }
 
 // bootstrap_spot_check_sample_rate: 1-in-N chunks get re-checked against a

@@ -224,7 +224,7 @@ func (connection *Connection) bootstrap_chain() error {
 					case <-done:
 						results <- indexed_result{index: i, call: call, peer: peer}
 					case <-time.After(bootstrap_chunk_request_timeout):
-						results <- indexed_result{index: i, call: &rpc2.Call{Error: fmt.Errorf("timed out after %s waiting for a response", bootstrap_chunk_request_timeout)}, peer: peer}
+						results <- indexed_result{index: i, call: &rpc2.Call{Error: fmt.Errorf("timed out after %s waiting for a response: %w", bootstrap_chunk_request_timeout, errBootstrapChunkTimeout)}, peer: peer}
 					}
 				}()
 			}
@@ -273,8 +273,9 @@ func (connection *Connection) bootstrap_chain() error {
 				if failed_peer == nil {
 					return false, fmt.Errorf("balance-tree chunk %d: %w", idx, cause)
 				}
-				failed_peer.exit()
-				live_pool.mark_dead(failed_peer.Addr.String())
+				if dropped, reason := live_pool.handle_failure(failed_peer, cause); dropped {
+					failed_peer.logger.V(1).Info("bootstrap: dropping peer", "addr", failed_peer.Addr.String(), "reason", reason)
+				}
 				if already_tried[idx] == nil {
 					already_tried[idx] = map[string]bool{}
 				}
@@ -451,7 +452,7 @@ func (connection *Connection) bootstrap_chain() error {
 				case <-done:
 					sc_meta_results <- sc_meta_indexed_result{index: i, call: call, peer: peer}
 				case <-time.After(bootstrap_chunk_request_timeout):
-					sc_meta_results <- sc_meta_indexed_result{index: i, call: &rpc2.Call{Error: fmt.Errorf("timed out after %s waiting for a response", bootstrap_chunk_request_timeout)}, peer: peer}
+					sc_meta_results <- sc_meta_indexed_result{index: i, call: &rpc2.Call{Error: fmt.Errorf("timed out after %s waiting for a response: %w", bootstrap_chunk_request_timeout, errBootstrapChunkTimeout)}, peer: peer}
 				}
 			}()
 		}
@@ -481,8 +482,9 @@ func (connection *Connection) bootstrap_chain() error {
 			if failed_peer == nil {
 				return false, fmt.Errorf("SC-meta chunk %d: %w", idx, cause)
 			}
-			failed_peer.exit()
-			live_pool.mark_dead(failed_peer.Addr.String())
+			if dropped, reason := live_pool.handle_failure(failed_peer, cause); dropped {
+				failed_peer.logger.V(1).Info("bootstrap: dropping peer", "addr", failed_peer.Addr.String(), "reason", reason)
+			}
 			if already_tried_sc_meta[idx] == nil {
 				already_tried_sc_meta[idx] = map[string]bool{}
 			}
@@ -572,7 +574,7 @@ func (connection *Connection) bootstrap_chain() error {
 						}
 						return &response, nil
 					case <-time.After(bootstrap_chunk_request_timeout):
-						return nil, fmt.Errorf("timed out after %s waiting for a response", bootstrap_chunk_request_timeout)
+						return nil, fmt.Errorf("timed out after %s waiting for a response: %w", bootstrap_chunk_request_timeout, errBootstrapChunkTimeout)
 					}
 				}
 
@@ -650,8 +652,9 @@ func (connection *Connection) bootstrap_chain() error {
 							return res
 						}
 						failed_peer := peer
-						failed_peer.exit()
-						live_pool.mark_dead(failed_peer.Addr.String())
+						if dropped, reason := live_pool.handle_failure(failed_peer, res.err); dropped {
+							failed_peer.logger.V(1).Info("bootstrap: dropping peer", "addr", failed_peer.Addr.String(), "reason", reason)
+						}
 						already_tried[failed_peer.Addr.String()] = true
 						alt := live_pool.pick_alternate(already_tried)
 						if alt == nil {
