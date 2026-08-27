@@ -678,27 +678,58 @@ func (connection *Connection) bootstrap_chain() error {
 					sc_inflight++
 				}
 
-				for done := 0; done < len(ts_response.Keys); done++ {
-					res := <-sc_results
-					sc_inflight--
-					if res.err != nil {
-						return res.err
-					}
+				// This whole drain runs inside an immediately-invoked closure
+				// so progress_ticker's defer is scoped to just THIS outer
+				// chunk's nested fetch, not to bootstrap_chain as a whole -
+				// a bare defer here would only fire when the whole method
+				// returns, leaking one running ticker per outer chunk for
+				// the rest of the bootstrap run.
+				if err := func() error {
+					// progress_ticker fires while this outer chunk's nested
+					// per-SC fetch is between completions - the only signal
+					// an operator gets during a long stretch (many SCs in
+					// flight, or one huge SC's own sequential
+					// continuation-chunk fetch) where nothing else logs at
+					// any verbosity short of V(3). Read only by this same
+					// goroutine (the select below is the only receiver), so
+					// there's no concurrent-access risk the way a shared
+					// counter touched by the fetch_one_sc goroutines
+					// themselves would have.
+					progress_ticker := time.NewTicker(bootstrap_sc_progress_tick_interval)
+					defer progress_ticker.Stop()
 
-					sc_data_tree, terr := ss.GetTree(string(res.key))
-					if terr != nil {
-						panic(terr)
-					}
-					for k := range res.keys {
-						sc_data_tree.Put(res.keys[k], res.values[k])
-					}
-					changed_trees = append(changed_trees, sc_data_tree)
+					for done := 0; done < len(ts_response.Keys); {
+						var res sc_fetch_result
+						select {
+						case res = <-sc_results:
+						case <-progress_ticker.C:
+							connection.logger.V(1).Info("bootstrap: step 2 still fetching SC data trees", "done", done, "total_this_chunk", len(ts_response.Keys), "in_flight", sc_inflight)
+							continue
+						}
+						done++
+						sc_inflight--
+						if res.err != nil {
+							return res.err
+						}
 
-					if sc_next < len(ts_response.Keys) {
-						launch(sc_next)
-						sc_next++
-						sc_inflight++
+						sc_data_tree, terr := ss.GetTree(string(res.key))
+						if terr != nil {
+							panic(terr)
+						}
+						for k := range res.keys {
+							sc_data_tree.Put(res.keys[k], res.values[k])
+						}
+						changed_trees = append(changed_trees, sc_data_tree)
+
+						if sc_next < len(ts_response.Keys) {
+							launch(sc_next)
+							sc_next++
+							sc_inflight++
+						}
 					}
+					return nil
+				}(); err != nil {
+					return err
 				}
 
 				total_keys += len(ts_response.Keys)

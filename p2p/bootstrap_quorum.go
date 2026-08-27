@@ -283,6 +283,20 @@ const bootstrap_spot_check_sample_rate = 10
 // phase, not just the one chunk.
 const bootstrap_chunk_request_timeout = 30 * time.Second
 
+// bootstrap_sc_progress_tick_interval bounds how long step 2's nested
+// per-SC data-tree fetch can stay silent at default log verbosity. Its
+// drain loop (in bootstrap_chain) only advances the visible percent once
+// an entire outer SC-meta chunk - every SC discovered in it, including any
+// single huge SC's own sequential continuation-chunk fetch - finishes, so
+// without this an operator has no signal at all during that window short
+// of raising verbosity into per-chunk noise or a fatal SIGQUIT dump
+// (live-observed: an 8-minute silent gap, confirmed real and bounded only
+// via a goroutine dump). 20s split the difference between "frequent enough
+// that an operator isn't left guessing" and "rare enough to stay
+// low-volume" - well under bootstrap_chunk_request_timeout so a tick can
+// still land even while a single request is the thing in flight.
+const bootstrap_sc_progress_tick_interval = 20 * time.Second
+
 // hash_tree_section_response computes a canonical hash of a
 // Response_Tree_Section_Struct's meaningful content (Keys, Values, in
 // order) - same rationale as hash_changes_response: per-connection fields
