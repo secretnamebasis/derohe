@@ -22,6 +22,7 @@ import (
 	"math/big"
 	"math/bits"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -640,11 +641,35 @@ func (connection *Connection) bootstrap_chain() error {
 				// contained here since this whole call already runs in its
 				// own goroutine, so there's no outer drain-loop bookkeeping
 				// to coordinate with.
+				// current_sc_peers tracks, per in-flight slot (idx), which peer
+				// that slot's fetch_one_sc goroutine is actually trying right
+				// now - written by those goroutines (one entry each, added on
+				// pick/retry, removed when the goroutine returns), read by the
+				// progress ticker below so it can name real peers instead of
+				// the fixed connection.logger identity every other log in this
+				// function deliberately uses (see the "Bootstrap Initiated"
+				// comment above). Scoped to this one outer chunk's closure,
+				// same lifetime as sc_results/live_pool - fresh per chunk, no
+				// cross-chunk leak.
+				var current_sc_peers_mu sync.Mutex
+				current_sc_peers := map[int]string{}
+
 				fetch_one_sc := func(idx int, key []byte) sc_fetch_result {
 					peer := live_pool.pick(int64(idx))
 					if peer == nil {
 						return sc_fetch_result{key: key, err: fmt.Errorf("no live peers remaining")}
 					}
+					set_current_peer := func(p *Connection) {
+						current_sc_peers_mu.Lock()
+						current_sc_peers[idx] = p.Addr.String()
+						current_sc_peers_mu.Unlock()
+					}
+					defer func() {
+						current_sc_peers_mu.Lock()
+						delete(current_sc_peers, idx)
+						current_sc_peers_mu.Unlock()
+					}()
+					set_current_peer(peer)
 					already_tried := map[string]bool{}
 					for {
 						res := attempt_fetch_sc(key, peer)
@@ -662,6 +687,7 @@ func (connection *Connection) bootstrap_chain() error {
 						}
 						alt.logger.V(3).Info("retrying SC data-tree fetch on alternate peer", "key", fmt.Sprintf("%x", key), "failed_peer", failed_peer.Addr.String(), "cause", res.err)
 						peer = alt
+						set_current_peer(peer)
 					}
 				}
 
@@ -703,7 +729,13 @@ func (connection *Connection) bootstrap_chain() error {
 						select {
 						case res = <-sc_results:
 						case <-progress_ticker.C:
-							connection.logger.V(1).Info("bootstrap: step 2 still fetching SC data trees", "done", done, "total_this_chunk", len(ts_response.Keys), "in_flight", sc_inflight)
+							current_sc_peers_mu.Lock()
+							active_peers := make([]string, 0, len(current_sc_peers))
+							for _, addr := range current_sc_peers {
+								active_peers = append(active_peers, addr)
+							}
+							current_sc_peers_mu.Unlock()
+							connection.logger.V(1).Info("bootstrap: step 2 still fetching SC data trees", "done", done, "total_this_chunk", len(ts_response.Keys), "in_flight", sc_inflight, "active_peers", active_peers)
 							continue
 						}
 						done++
