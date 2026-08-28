@@ -621,6 +621,7 @@ func (connection *Connection) bootstrap_chain() error {
 
 					if sc_response.KeyCount < 4096 {
 						peer.logger.V(3).Info("served SC data-tree fetch", "key", fmt.Sprintf("%x", key))
+						bootstrap_spot_check_chunk(fanout_peers, peer, sc_response, string(key), request.TopoHeights[0], section[:], 0, fmt.Sprintf("SC data-tree %x", key))
 						return sc_fetch_result{key: key, keys: sc_response.Keys, values: sc_response.Values}
 					}
 
@@ -654,6 +655,7 @@ func (connection *Connection) bootstrap_chain() error {
 						if len(sc_ts_response.Keys) != len(sc_ts_response.Values) {
 							return sc_fetch_result{key: key, err: fmt.Errorf("mismatched key and value count")}
 						}
+						bootstrap_spot_check_chunk(fanout_peers, peer, sc_ts_response, string(key), request.TopoHeights[0], sc_section[:], uint64(sc_path_length), fmt.Sprintf("SC data-tree %x continuation chunk %d", key, k))
 						all_keys = append(all_keys, sc_ts_response.Keys...)
 						all_values = append(all_values, sc_ts_response.Values...)
 					}
