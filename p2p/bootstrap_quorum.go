@@ -48,7 +48,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -145,33 +147,81 @@ func bootstrap_chunk_fanout_peers(fallback *Connection, target int64) []*Connect
 // was - no probing, no positional bias, by construction.
 type bootstrap_live_peer_pool struct {
 	mu             sync.Mutex
-	live           []*Connection
+	live           []*Connection  // kept sorted ascending by bootstrap_effective_latency
 	timeout_counts map[string]int // addr -> bare-timeout count this phase, see handle_failure
+}
+
+// bootstrap_pick_top_k bounds how many of the fastest currently-live peers
+// pick() rotates across. A deliberate, bounded concentration on proven-fast
+// peers, instead of pick()'s previous plain modulo across the WHOLE live
+// set - which, once that set shrank, collapsed traffic onto whoever
+// happened to survive by accident (cycles 22/23 live data: a single
+// survivor serving nearly all in-flight slots for extended stretches,
+// independent of step 1's own request volume). Bounded rather than
+// unbounded (e.g. always-the-single-fastest) so the fastest peer never
+// becomes a lone point of failure while more than top_k peers remain live.
+// Starting value, not yet tuned against live data - kata cycle 24 item 2.
+const bootstrap_pick_top_k = 4
+
+// bootstrap_effective_latency reads a peer's live, continuously-updated
+// Latency (real RTT from timed syncs, see common.go's fill_common_T0T1T2
+// path) as a sort key, treating an unmeasured peer (Latency <= 0 - a
+// connection that hasn't completed a timed sync ping yet) as WORST-case,
+// not best-case. A naive ascending sort with unmeasured peers left at their
+// zero value would wrongly send them to the front, ahead of peers with
+// real, but nonzero, measured latency.
+func bootstrap_effective_latency(c *Connection) int64 {
+	l := atomic.LoadInt64(&c.Latency)
+	if l <= 0 {
+		return math.MaxInt64
+	}
+	return l
+}
+
+// bootstrap_sort_by_latency sorts live ascending by bootstrap_effective_latency.
+// Callers must hold p.mu.
+func (p *bootstrap_live_peer_pool) sort_by_latency() {
+	sort.SliceStable(p.live, func(i, j int) bool {
+		return bootstrap_effective_latency(p.live[i]) < bootstrap_effective_latency(p.live[j])
+	})
 }
 
 func new_bootstrap_live_peer_pool(peers []*Connection) *bootstrap_live_peer_pool {
 	live := make([]*Connection, len(peers))
 	copy(live, peers)
-	return &bootstrap_live_peer_pool{live: live}
+	p := &bootstrap_live_peer_pool{live: live}
+	p.sort_by_latency()
+	return p
 }
 
-// pick returns a peer for index i, chosen evenly from whoever is currently
-// live. nil if every peer in the pool has been marked dead.
+// pick returns a peer for index i, chosen evenly from among only the
+// bootstrap_pick_top_k fastest currently-live peers (all of them, if fewer
+// than top_k remain - identical to the old plain-modulo behavior in that
+// case). nil if every peer in the pool has been marked dead. live is kept
+// sorted by latency (at construction and on every mark_dead removal, not
+// on every pick - removals are comparatively rare against pick()'s
+// per-request call frequency), so live[:k] is always the current top_k.
 func (p *bootstrap_live_peer_pool) pick(i int64) *Connection {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.live) == 0 {
 		return nil
 	}
-	return p.live[i%int64(len(p.live))]
+	k := bootstrap_pick_top_k
+	if len(p.live) < k {
+		k = len(p.live)
+	}
+	return p.live[i%int64(k)]
 }
 
-// mark_dead removes a peer from the live set - swap-with-last, since
-// selection only needs uniformity, not order. Safe to call more than once
-// for the same peer (a no-op after the first removal) - returns whether
-// this call actually performed the removal, so a caller logging the event
-// can tell a real first-time drop from a redundant later call against a
-// peer that's already gone.
+// mark_dead removes a peer from the live set - swap-with-last, then
+// re-sorts by latency so live[:top_k] reflects the current fastest
+// survivors (a dead top_k peer's slot is naturally backfilled by whoever's
+// next-fastest, instead of pick() continuing to rotate a smaller effective
+// window). Safe to call more than once for the same peer (a no-op after
+// the first removal) - returns whether this call actually performed the
+// removal, so a caller logging the event can tell a real first-time drop
+// from a redundant later call against a peer that's already gone.
 func (p *bootstrap_live_peer_pool) mark_dead(addr string) (removed bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -179,6 +229,7 @@ func (p *bootstrap_live_peer_pool) mark_dead(addr string) (removed bool) {
 		if c.Addr.String() == addr {
 			p.live[idx] = p.live[len(p.live)-1]
 			p.live = p.live[:len(p.live)-1]
+			p.sort_by_latency()
 			return true
 		}
 	}

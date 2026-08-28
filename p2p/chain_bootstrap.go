@@ -111,6 +111,12 @@ func (connection *Connection) bootstrap_chain() error {
 	}
 	response = *manifest
 	connection = chosen_connection
+	// Every other RPC response carrying a Common field gets applied via
+	// .update() (handshake, ping, peer-list broadcast, object request) -
+	// this manifest response is no different, and connection now points at
+	// chosen_connection, whose bookkeeping (Height/TopoHeight/StateHash)
+	// would otherwise sit stale until some unrelated future RPC refreshes it.
+	connection.update(&response.Common)
 	// "Bootstrap Initiated" logs here, after the reassignment above, so it
 	// and every subsequent per-step log in this function share the same
 	// peer address - logging it before the reassignment made it look like

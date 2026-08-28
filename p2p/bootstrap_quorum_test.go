@@ -19,10 +19,166 @@ package p2p
 import (
 	"fmt"
 	"net"
+	"sort"
+	"sync"
 	"testing"
 
 	"github.com/deroproject/derohe/globals"
 )
+
+func make_test_pool_conn(port int, latency int64) *Connection {
+	return &Connection{
+		Addr:    &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: port},
+		Latency: latency,
+	}
+}
+
+// Test_Live_Peer_Pool_Pick_Prefers_Low_Latency_Top_K asserts pick()'s actual
+// selection distribution, not just that it runs without panicking - cycle
+// 24's own obstacle list called out that a weaker test would repeat cycle
+// 21's mistake (visibility/behavior code that doesn't verify what it
+// claims). With 8 peers at distinct latencies and top_k=4, every pick()
+// call across a large index range must land on one of the 4 genuinely
+// lowest-latency peers, and all 4 of them must actually be reachable -
+// ruling out both "picks outside the intended window" and "collapses onto
+// fewer than top_k peers despite top_k being available".
+func Test_Live_Peer_Pool_Pick_Prefers_Low_Latency_Top_K(t *testing.T) {
+	type peer_spec struct {
+		port    int
+		latency int64
+	}
+	specs := []peer_spec{
+		{20301, 300}, {20302, 50}, {20303, 400}, {20304, 10},
+		{20305, 200}, {20306, 20}, {20307, 500}, {20308, 100},
+	}
+	var peers []*Connection
+	for _, s := range specs {
+		peers = append(peers, make_test_pool_conn(s.port, s.latency))
+	}
+
+	want_top_k := append([]*Connection{}, peers...)
+	sort.SliceStable(want_top_k, func(i, j int) bool {
+		return bootstrap_effective_latency(want_top_k[i]) < bootstrap_effective_latency(want_top_k[j])
+	})
+	want_top_k = want_top_k[:bootstrap_pick_top_k]
+	want_addrs := map[string]bool{}
+	for _, c := range want_top_k {
+		want_addrs[c.Addr.String()] = true
+	}
+
+	pool := new_bootstrap_live_peer_pool(peers)
+	seen := map[string]bool{}
+	for i := int64(0); i < 40; i++ {
+		picked := pool.pick(i)
+		if picked == nil {
+			t.Fatalf("pick(%d) returned nil with %d live peers", i, len(peers))
+		}
+		addr := picked.Addr.String()
+		if !want_addrs[addr] {
+			t.Fatalf("pick(%d) returned %s, latency %d - not among the %d lowest-latency peers %v",
+				i, addr, picked.Latency, bootstrap_pick_top_k, want_addrs)
+		}
+		seen[addr] = true
+	}
+	if len(seen) != bootstrap_pick_top_k {
+		t.Fatalf("expected all %d top-k peers to be reachable via pick(), only saw %d: %v", bootstrap_pick_top_k, len(seen), seen)
+	}
+}
+
+// Test_Live_Peer_Pool_Pick_Treats_Unmeasured_Latency_As_Worst guards the
+// specific failure mode cycle 24's own obstacle list called out: a naive
+// ascending sort would leave an unmeasured peer (Latency == 0, its Go zero
+// value) at the front, wrongly treating "we haven't measured this peer
+// yet" as "this is the fastest peer". With one unmeasured peer among more
+// than top_k real-latency peers, the unmeasured one must never appear in
+// pick()'s rotation.
+func Test_Live_Peer_Pool_Pick_Treats_Unmeasured_Latency_As_Worst(t *testing.T) {
+	unmeasured := make_test_pool_conn(20401, 0)
+	peers := []*Connection{
+		unmeasured,
+		make_test_pool_conn(20402, 10),
+		make_test_pool_conn(20403, 20),
+		make_test_pool_conn(20404, 30),
+		make_test_pool_conn(20405, 40),
+		make_test_pool_conn(20406, 50),
+	}
+	pool := new_bootstrap_live_peer_pool(peers)
+	unmeasured_addr := unmeasured.Addr.String()
+	for i := int64(0); i < 40; i++ {
+		picked := pool.pick(i)
+		if picked.Addr.String() == unmeasured_addr {
+			t.Fatalf("pick(%d) returned the unmeasured (Latency=0) peer - it should sort last, not first", i)
+		}
+	}
+}
+
+// Test_Live_Peer_Pool_Mark_Dead_Repromotes_Next_Fastest confirms the
+// bounded top-k window actually refills from the next-fastest survivor
+// once a top-k peer dies, rather than pick() silently rotating a smaller
+// effective window forever.
+func Test_Live_Peer_Pool_Mark_Dead_Repromotes_Next_Fastest(t *testing.T) {
+	fastest := make_test_pool_conn(20501, 10)
+	second := make_test_pool_conn(20502, 20)
+	third := make_test_pool_conn(20503, 30)
+	fourth := make_test_pool_conn(20504, 40)
+	fifth_excluded := make_test_pool_conn(20505, 50) // outside top_k=4 initially
+
+	pool := new_bootstrap_live_peer_pool([]*Connection{fastest, second, third, fourth, fifth_excluded})
+
+	excluded_addr := fifth_excluded.Addr.String()
+	for i := int64(0); i < 20; i++ {
+		if pool.pick(i).Addr.String() == excluded_addr {
+			t.Fatalf("pick(%d) returned the 5th-fastest peer while top_k=4 peers were still live", i)
+		}
+	}
+
+	if !pool.mark_dead(fastest.Addr.String()) {
+		t.Fatalf("mark_dead should report true removing a live peer")
+	}
+
+	promoted := false
+	for i := int64(0); i < 20; i++ {
+		if pool.pick(i).Addr.String() == excluded_addr {
+			promoted = true
+			break
+		}
+	}
+	if !promoted {
+		t.Fatalf("expected the 5th-fastest peer to be promoted into the top-k window after the fastest peer died")
+	}
+}
+
+// Test_Live_Peer_Pool_Concurrent_Pick_And_Mark_Dead is the load-bearing
+// -race check for this cycle's change: pick() and mark_dead() are called
+// concurrently from many goroutines in real bootstrap runs (cycles 20/22
+// already established this), and the new sort-on-mutation logic must not
+// introduce a race or a panic under that same concurrency.
+func Test_Live_Peer_Pool_Concurrent_Pick_And_Mark_Dead(t *testing.T) {
+	var peers []*Connection
+	for i := 0; i < 30; i++ {
+		peers = append(peers, make_test_pool_conn(20600+i, int64(i+1)*7))
+	}
+	pool := new_bootstrap_live_peer_pool(peers)
+
+	var wg sync.WaitGroup
+	for g := 0; g < 16; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := int64(0); i < 200; i++ {
+				pool.pick(int64(g)*200 + i)
+			}
+		}(g)
+	}
+	for _, c := range peers[:10] {
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			pool.mark_dead(addr)
+		}(c.Addr.String())
+	}
+	wg.Wait()
+}
 
 func Test_Select_Bootstrap_Tier_Boundaries(t *testing.T) {
 	cases := []struct {
