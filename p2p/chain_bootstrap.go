@@ -117,11 +117,18 @@ func (connection *Connection) bootstrap_chain() error {
 	// chosen_connection, whose bookkeeping (Height/TopoHeight/StateHash)
 	// would otherwise sit stale until some unrelated future RPC refreshes it.
 	connection.update(&response.Common)
-	// "Bootstrap Initiated" logs here, after the reassignment above, so it
-	// and every subsequent per-step log in this function share the same
-	// peer address - logging it before the reassignment made it look like
-	// two different peers were handling one bootstrap run, when it was
-	// really the same run continuing on the peer the quorum settled on.
+	// "Bootstrap Initiated" logs here, after the reassignment above -
+	// logging it before the reassignment made it look like two different
+	// peers were handling one bootstrap run, when it was really the same
+	// run continuing on the peer the quorum settled on. This is a
+	// once-per-run log about which peer the quorum picked, unlike the
+	// step1/step2 percent-progress logs further down, which intentionally
+	// use res.peer (whichever peer's completion actually advanced the
+	// water mark) instead of this fixed connection - the fixed identity
+	// here is correct for a one-time "who did the quorum pick" log, but
+	// was a real bug when it leaked into those per-request progress
+	// signals, making genuinely swarmed fetching look like it was all
+	// coming from one peer.
 	connection.logger.Info("Bootstrap Initiated")
 	connection.logger.V(1).Info("changeset received (tiered manifest fetch)", "keycount", response.KeyCount, "sccount", response.SCKeyCount)
 
@@ -369,7 +376,7 @@ func (connection *Connection) bootstrap_chain() error {
 				// out-of-order completion that doesn't represent new
 				// resumable progress.
 				if low_water_mark != prev_water_mark {
-					connection.logger.Info("Bootstrap in progress(step1)", "percent", float32(low_water_mark*100)/float32(chunks))
+					res.peer.logger.Info("Bootstrap in progress(step1)", "percent", float32(low_water_mark*100)/float32(chunks))
 				}
 				done_count++
 
@@ -795,7 +802,7 @@ func (connection *Connection) bootstrap_chain() error {
 			// same watermark-not-completion-index reasoning as step 1's log
 			// site - see the comment there.
 			if low_water_mark != prev_water_mark {
-				connection.logger.Info("Bootstrap in progress(step 2)", "percent", float32(low_water_mark*100)/float32(chunks))
+				res.peer.logger.Info("Bootstrap in progress(step 2)", "percent", float32(low_water_mark*100)/float32(chunks))
 			}
 			done_count++
 
