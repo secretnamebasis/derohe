@@ -17,6 +17,7 @@
 package p2p
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"net"
 	"sort"
@@ -332,5 +333,27 @@ func Test_Pick_Alternate_Falls_Back_Once_Top_K_Exhausted(t *testing.T) {
 	already_tried[peers[4].Addr.String()] = true
 	if exhausted := pool.pick_alternate(already_tried); exhausted != nil {
 		t.Fatalf("expected nil once every live peer has been tried, got %+v", exhausted)
+	}
+}
+
+// Test_Spot_Check_Classify_Resolves_When_Retry_Reads_Agree and
+// Test_Spot_Check_Classify_Confirms_When_Retry_Reads_Still_Differ assert the
+// actual resolved-vs-confirmed decision bootstrap_spot_check_classify makes -
+// this is the exact logic cycle 28 exists to get right (a first mismatch is
+// noise unless it survives a retry), so it needs its own direct test, not
+// just "the retry code compiles".
+func Test_Spot_Check_Classify_Resolves_When_Retry_Reads_Agree(t *testing.T) {
+	a := sha256.Sum256([]byte("same content"))
+	b := sha256.Sum256([]byte("same content"))
+	if !bootstrap_spot_check_classify(a, b) {
+		t.Fatalf("expected two identical retry hashes to classify as resolved")
+	}
+}
+
+func Test_Spot_Check_Classify_Confirms_When_Retry_Reads_Still_Differ(t *testing.T) {
+	a := sha256.Sum256([]byte("peer A's data"))
+	b := sha256.Sum256([]byte("peer B's data"))
+	if bootstrap_spot_check_classify(a, b) {
+		t.Fatalf("expected two different retry hashes to classify as NOT resolved (confirmed)")
 	}
 }

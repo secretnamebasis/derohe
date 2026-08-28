@@ -360,6 +360,25 @@ func (p *bootstrap_live_peer_pool) handle_failure(failed_peer *Connection, cause
 // chunk count - the whole point versus full per-chunk quorum.
 const bootstrap_spot_check_sample_rate = 10
 
+// bootstrap_spot_check_retry_delay: how long to wait before re-checking a
+// mismatched chunk, giving an in-flight commit/finalization window time to
+// clear. Grounded in this session's own live-reproduced case, not a guess -
+// a getsc read returned a stale value for a few seconds during our own
+// node's commit finalization, then self-corrected with no code change in
+// between. Distinct from bootstrap_chunk_request_timeout's own reasoning
+// (that's inter-completion gaps under normal fetch load - a different
+// phenomenon), so a separate constant rather than reusing that value.
+const bootstrap_spot_check_retry_delay = 2 * time.Second
+
+// bootstrap_spot_check_classify decides whether two fresh, independent
+// re-reads of the same chunk agree (the original mismatch was transient) or
+// still disagree (a confirmed, real signal). Factored out as a pure
+// function so this decision is unit-testable without mocking rpc2/network
+// I/O - see bootstrap_quorum_test.go.
+func bootstrap_spot_check_classify(retry_hash_a, retry_hash_b [32]byte) (resolved bool) {
+	return retry_hash_a == retry_hash_b
+}
+
 // bootstrap_chunk_request_timeout bounds how long a single TreeSection
 // request (balance tree, SC-meta outer, per-SC, per-SC continuation) waits
 // for a response before being treated as a failure and retried on a
@@ -458,11 +477,70 @@ func bootstrap_spot_check_chunk(peers []*Connection, answered_by *Connection, or
 			logger.V(2).Info("bootstrap spot-check: re-fetch failed, skipping", "chunk", chunk_desc, "checker", checker.Addr.String(), "err", err)
 			return
 		}
+		// Latency included directly on both log lines so a live run can
+		// test whether disagreement correlates with peer speed (e.g. the
+		// fastest/most-selected peers being the ones most often involved)
+		// without needing to cross-reference against separate progress logs.
+		answered_by_latency := atomic.LoadInt64(&answered_by.Latency)
+		checker_latency := atomic.LoadInt64(&checker.Latency)
 		if hash_tree_section_response(&ts_response) != hash_tree_section_response(original) {
-			logger.Error(nil, "bootstrap spot-check: DISAGREEMENT between peers for the same chunk", "chunk", chunk_desc, "answered_by", answered_by.Addr.String(), "checked_by", checker.Addr.String())
+			// A single mismatch here does NOT mean the chain's real state
+			// disagrees - live-investigated at length: full contract
+			// content (variables, code, balance) matched byte-for-byte
+			// across 14+ independent peers, at both current tip and the
+			// exact pinned historical topoheight bootstrap used, and the
+			// network's whole-state Merkle treehash matched across 10
+			// independent peers too. We separately reproduced the actual
+			// mechanism live: a getsc read returned a stale value for a
+			// few seconds during our own node's commit finalization, then
+			// self-corrected with no code change in between. So a first
+			// mismatch is treated as likely-transient noise, not logged as
+			// a confirmed disagreement - only escalated if it survives a
+			// retry against BOTH sides fresh (see below).
+			logger.V(1).Info("bootstrap spot-check: mismatch, retrying", "chunk", chunk_desc, "answered_by", answered_by.Addr.String(), "answered_by_latency", answered_by_latency, "checked_by", checker.Addr.String(), "checked_by_latency", checker_latency)
+
+			time.Sleep(bootstrap_spot_check_retry_delay)
+
+			retry_request := Request_Tree_Section_Struct{Topo: topo, TreeName: []byte(tree_name), Section: section, SectionLength: section_length}
+			fill_common(&retry_request.Common)
+			var retry_a, retry_b Response_Tree_Section_Struct
+			err_a := answered_by.Client.Call("Peer.TreeSection", retry_request, &retry_a)
+			err_b := checker.Client.Call("Peer.TreeSection", retry_request, &retry_b)
+			if err_a != nil || err_b != nil {
+				logger.V(1).Info("bootstrap spot-check: retry inconclusive (re-fetch failed), not escalating", "chunk", chunk_desc, "answered_by_err", err_a, "checked_by_err", err_b)
+				return
+			}
+
+			// Compare the two FRESH reads to each other, never a fresh
+			// read against either original response - either side could
+			// have been the one that hit the transient race, so neither
+			// original response is trustworthy enough to anchor against.
+			if bootstrap_spot_check_classify(hash_tree_section_response(&retry_a), hash_tree_section_response(&retry_b)) {
+				logger.V(1).Info("bootstrap spot-check: mismatch resolved on retry (transient)", "chunk", chunk_desc, "answered_by", answered_by.Addr.String(), "checked_by", checker.Addr.String())
+				return
+			}
+
+			// Key counts and edge keys included since a CONFIRMED
+			// disagreement should now be a genuinely rare event (the
+			// dominant real cause - a shared, mutated-in-place section
+			// buffer read late by this goroutine - was found and fixed in
+			// chain_bootstrap.go's per-SC continuation loop) - if one
+			// still occurs, this is enough detail to tell truncation
+			// (10,000-key response cap) apart from a real key-set or
+			// value difference without a second investigation from scratch.
+			var first_a, last_a, first_b, last_b string
+			if len(retry_a.Keys) > 0 {
+				first_a = fmt.Sprintf("%x", retry_a.Keys[0])
+				last_a = fmt.Sprintf("%x", retry_a.Keys[len(retry_a.Keys)-1])
+			}
+			if len(retry_b.Keys) > 0 {
+				first_b = fmt.Sprintf("%x", retry_b.Keys[0])
+				last_b = fmt.Sprintf("%x", retry_b.Keys[len(retry_b.Keys)-1])
+			}
+			logger.Error(nil, "bootstrap spot-check: CONFIRMED disagreement after retry", "chunk", chunk_desc, "answered_by", answered_by.Addr.String(), "answered_by_latency", answered_by_latency, "checked_by", checker.Addr.String(), "checked_by_latency", checker_latency, "a_keycount", len(retry_a.Keys), "a_first_key", first_a, "a_last_key", last_a, "b_keycount", len(retry_b.Keys), "b_first_key", first_b, "b_last_key", last_b)
 			return
 		}
-		logger.V(3).Info("bootstrap spot-check: peers agree", "chunk", chunk_desc, "answered_by", answered_by.Addr.String(), "checked_by", checker.Addr.String())
+		logger.V(3).Info("bootstrap spot-check: peers agree", "chunk", chunk_desc, "answered_by", answered_by.Addr.String(), "answered_by_latency", answered_by_latency, "checked_by", checker.Addr.String(), "checked_by_latency", checker_latency)
 	}()
 }
 

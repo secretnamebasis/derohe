@@ -170,7 +170,7 @@ func (connection *Connection) bootstrap_chain() error {
 		step1_started := time.Now()
 
 		if state.Step < 2 {
-			connection.logger.Info("==================== BOOTSTRAP STEP 1 STARTED: fetching balance tree ====================", "estimated_keys", response.KeyCount, "chunks", chunks, "resuming_from_chunk", state.Chunk)
+			connection.logger.Info("==================== BOOTSTRAP STEP 1 STARTED: fetching balance tree ====================", "estimated_keys", response.KeyCount, "chunks", chunks, "resuming_from_chunk", state.Chunk, "topoheight", request.TopoHeights[0])
 
 			// Fan the chunk fetch itself across every eligible peer, not just
 			// the single quorum-chosen connection - reuses the same
@@ -418,7 +418,7 @@ func (connection *Connection) bootstrap_chain() error {
 
 		total_keys := 0
 		step2_started := time.Now()
-		connection.logger.Info("==================== BOOTSTRAP STEP 2 STARTED: fetching SC-meta and per-SC data trees ====================", "estimated_keys", response.SCKeyCount, "chunks", chunks, "resuming_from_chunk", state.Chunk)
+		connection.logger.Info("==================== BOOTSTRAP STEP 2 STARTED: fetching SC-meta and per-SC data trees ====================", "estimated_keys", response.SCKeyCount, "chunks", chunks, "resuming_from_chunk", state.Chunk, "topoheight", request.TopoHeights[0])
 
 		// Fan the SC-meta chunk fetch across eligible peers too - same
 		// pattern as the balance tree above. Recomputed fresh here rather
@@ -643,8 +643,21 @@ func (connection *Connection) bootstrap_chain() error {
 					all_keys := append([][]byte{}, sc_response.Keys...)
 					all_values := append([][]byte{}, sc_response.Values...)
 
-					var sc_section [8]byte
 					for k := int64(0); k < sc_chunks; k++ {
+						// A fresh array EVERY iteration, not one shared
+						// buffer mutated in place across the loop - the
+						// only thing standing between this and a real bug:
+						// bootstrap_spot_check_chunk hands this slice to a
+						// detached goroutine that reads it later (and,
+						// since kata cycle 28's retry, sleeps for 2s
+						// first). A shared, reused buffer would have
+						// already been overwritten with a LATER
+						// iteration's bytes by the time that goroutine
+						// runs - comparing against the wrong chunk
+						// entirely, not a real peer disagreement. Live-
+						// caught: this exact bug explained the bulk of
+						// every "disagreement" investigated this session.
+						var sc_section [8]byte
 						binary.BigEndian.PutUint64(sc_section[:], bits.Reverse64(uint64(k))) // place reverse path
 						sc_ts_request := Request_Tree_Section_Struct{Topo: request.TopoHeights[0], TreeName: key, Section: sc_section[:], SectionLength: uint64(sc_path_length)}
 						fill_common(&sc_ts_request.Common)
