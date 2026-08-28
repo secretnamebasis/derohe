@@ -285,10 +285,13 @@ func fetch_bootstrap_manifest(fallback_connection *Connection, request ChangeLis
 		logger.V(1).Info("fetch_bootstrap_manifest: quorum NOT reached at this tier, falling through", "tier", tier, "threshold", threshold)
 	}
 
-	// tier 3: a trusted peer if one is connected and eligible
+	// tier 3: a trusted peer if one is connected and eligible - still a
+	// single, unverified source (no quorum agreement backs this response),
+	// but at least an operator-configured one rather than whichever peer
+	// happened to be picked automatically.
 	for _, c := range eligible {
 		if is_trusted_peer(c) {
-			logger.V(1).Info("fetch_bootstrap_manifest: using trusted peer", "addr", c.Addr.String())
+			logger.Info("fetch_bootstrap_manifest: quorum NOT possible (too few eligible peers) - using a single OPERATOR-CONFIGURED TRUSTED peer, no cross-peer verification for this fetch", "addr", c.Addr.String())
 			var response Changes
 			r := request
 			fill_common(&r.Common)
@@ -298,8 +301,12 @@ func fetch_bootstrap_manifest(fallback_connection *Connection, request ChangeLis
 		}
 	}
 
-	// ultimate fallback: today's original, unchanged behavior
-	logger.V(1).Info("fetch_bootstrap_manifest: no trusted peer available, falling back to original single-peer behavior", "addr", fallback_connection.Addr.String())
+	// ultimate fallback: today's original, unchanged behavior - a single
+	// peer with NO quorum agreement and NO operator trust configuration at
+	// all backing it. Made loud deliberately, not silently accepted - this
+	// is a real, structural gap that neither spot-checking nor quorum can
+	// close, since both need a second peer by definition.
+	logger.Error(nil, "fetch_bootstrap_manifest: UNVERIFIED single-peer fallback - no quorum, no trusted peer available, accepting manifest data from one automatically-chosen peer with no cross-verification of any kind", "addr", fallback_connection.Addr.String())
 	var response Changes
 	r := request
 	fill_common(&r.Common)
