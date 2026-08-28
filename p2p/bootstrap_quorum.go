@@ -163,6 +163,20 @@ type bootstrap_live_peer_pool struct {
 // Starting value, not yet tuned against live data - kata cycle 24 item 2.
 const bootstrap_pick_top_k = 4
 
+// bootstrap_pick_recipients returns how many distinct peers pick() can
+// actually return out of a pool of the given size - min(bootstrap_pick_top_k,
+// pool_size). A total in-flight request budget should be sized by this, not
+// by the raw eligible-pool size: pick() only ever returns one of this many
+// peers, so sizing the budget by a larger number means the excess gets
+// funneled onto these same few recipients instead of the many peers it was
+// meant to spread across.
+func bootstrap_pick_recipients(pool_size int) int {
+	if pool_size < bootstrap_pick_top_k {
+		return pool_size
+	}
+	return bootstrap_pick_top_k
+}
+
 // bootstrap_effective_latency reads a peer's live, continuously-updated
 // Latency (real RTT from timed syncs, see common.go's fill_common_T0T1T2
 // path) as a sort key, treating an unmeasured peer (Latency <= 0 - a

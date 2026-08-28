@@ -209,8 +209,15 @@ func (connection *Connection) bootstrap_chain() error {
 			// all N peers, so firing total_pipeline requests ahead gives
 			// each peer ~pipeline of them, same per-peer concurrency this
 			// was already proven safe at, just no longer divided.
-			total_pipeline := int64(pipeline) * int64(len(fanout_peers))
-
+			//
+			// Sized by bootstrap_pick_recipients, not len(fanout_peers):
+			// since cycle 24, pick() only ever returns one of the top-k
+			// fastest live peers, not a uniform pick across the whole
+			// eligible pool - sizing the budget by the full pool size (as
+			// before cycle 24) would fire ~pipeline * len(fanout_peers)
+			// requests at only top_k actual recipients, several times each
+			// peer's intended undivided share instead of one.
+			total_pipeline := int64(pipeline) * int64(bootstrap_pick_recipients(len(fanout_peers)))
 			type indexed_result struct {
 				index int64
 				call  *rpc2.Call
@@ -443,7 +450,10 @@ func (connection *Connection) bootstrap_chain() error {
 		if outer_pipeline_per_peer > 4 {
 			outer_pipeline_per_peer = 4
 		}
-		outer_pipeline := outer_pipeline_per_peer * int64(len(fanout_peers))
+		// Sized by bootstrap_pick_recipients, not len(fanout_peers) - same
+		// reasoning as step1's total_pipeline above: pick() only ever
+		// returns one of the top-k fastest live peers since cycle 24.
+		outer_pipeline := outer_pipeline_per_peer * int64(bootstrap_pick_recipients(len(fanout_peers)))
 
 		type sc_meta_indexed_result struct {
 			index int64
