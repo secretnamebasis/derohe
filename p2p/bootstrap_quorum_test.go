@@ -263,3 +263,74 @@ func Test_Is_Trusted_Peer_Checks_Real_Priority_Node_List(t *testing.T) {
 		t.Fatalf("expected no peer to be trusted when --add-priority-node is unset")
 	}
 }
+
+// Test_Pick_Alternate_Diversifies_Within_Top_K asserts pick_alternate's
+// actual selection distribution - cycle 25 found the old always-first-match
+// behavior explained most of one live run's peer-credit skew (940 of 1452
+// ticks, 65%, to one peer), so a test that only checks "returns SOME peer"
+// would miss the exact defect that motivated this fix. With 6 peers (top_k=4)
+// and none tried yet, repeated calls must land on more than one of the top-4
+// fastest, and must never return a peer outside that window while any of the
+// top-4 remain untried.
+func Test_Pick_Alternate_Diversifies_Within_Top_K(t *testing.T) {
+	peers := []*Connection{
+		make_test_pool_conn(20701, 10), // top-4 by latency
+		make_test_pool_conn(20702, 20),
+		make_test_pool_conn(20703, 30),
+		make_test_pool_conn(20704, 40),
+		make_test_pool_conn(20705, 50), // outside top-4
+		make_test_pool_conn(20706, 60), // outside top-4
+	}
+	pool := new_bootstrap_live_peer_pool(peers)
+	top4 := map[string]bool{}
+	for _, c := range peers[:4] {
+		top4[c.Addr.String()] = true
+	}
+
+	seen := map[string]bool{}
+	for i := 0; i < 60; i++ {
+		alt := pool.pick_alternate(map[string]bool{})
+		if alt == nil {
+			t.Fatalf("pick_alternate(%d) returned nil with peers untried", i)
+		}
+		if !top4[alt.Addr.String()] {
+			t.Fatalf("pick_alternate(%d) returned %s, outside the top-4 window, while top-4 candidates remain untried", i, alt.Addr.String())
+		}
+		seen[alt.Addr.String()] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("expected pick_alternate to diversify across the top-4 window over 60 calls, only ever returned: %v", seen)
+	}
+}
+
+// Test_Pick_Alternate_Falls_Back_Once_Top_K_Exhausted confirms the outside-
+// the-window peers are only reachable once every top-k candidate has
+// already been tried for this chunk, not before.
+func Test_Pick_Alternate_Falls_Back_Once_Top_K_Exhausted(t *testing.T) {
+	peers := []*Connection{
+		make_test_pool_conn(20711, 10),
+		make_test_pool_conn(20712, 20),
+		make_test_pool_conn(20713, 30),
+		make_test_pool_conn(20714, 40),
+		make_test_pool_conn(20715, 50), // outside top-4
+	}
+	pool := new_bootstrap_live_peer_pool(peers)
+
+	already_tried := map[string]bool{}
+	for _, c := range peers[:4] {
+		already_tried[c.Addr.String()] = true
+	}
+
+	alt := pool.pick_alternate(already_tried)
+	if alt == nil {
+		t.Fatalf("expected a fallback candidate once the top-4 are exhausted")
+	}
+	if alt.Addr.String() != peers[4].Addr.String() {
+		t.Fatalf("expected the sole remaining peer %s, got %s", peers[4].Addr.String(), alt.Addr.String())
+	}
+
+	already_tried[peers[4].Addr.String()] = true
+	if exhausted := pool.pick_alternate(already_tried); exhausted != nil {
+		t.Fatalf("expected nil once every live peer has been tried, got %+v", exhausted)
+	}
+}

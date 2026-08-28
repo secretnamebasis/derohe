@@ -262,10 +262,37 @@ func (p *bootstrap_live_peer_pool) mark_dead(addr string) (removed bool) {
 func (p *bootstrap_live_peer_pool) pick_alternate(already_tried map[string]bool) *Connection {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for _, c := range p.live {
-		if !already_tried[c.Addr.String()] {
-			return c
+	// Returning the first untried peer in p.live's order (as this used to)
+	// deterministically favors the SAME single peer for every retry across
+	// a whole phase, since p.live is kept sorted ascending by latency -
+	// stronger than an arbitrary fixed bias, this always means the single
+	// fastest untried peer specifically. Live-caught (cycle 25): this
+	// explained most of one phase's peer-credit skew (940 of 1452 ticks,
+	// 65%, to one peer). Fixed to pick uniformly within the current top-k
+	// window first (consistent with pick()'s own bounded-concentration
+	// design over this same pool), falling back to the rest of the live
+	// pool only once every top-k candidate has already been tried for this
+	// chunk - a real, valid case, not treated as exhausted.
+	k := bootstrap_pick_top_k
+	if len(p.live) < k {
+		k = len(p.live)
+	}
+	var window_candidates, rest_candidates []*Connection
+	for i, c := range p.live {
+		if already_tried[c.Addr.String()] {
+			continue
 		}
+		if i < k {
+			window_candidates = append(window_candidates, c)
+		} else {
+			rest_candidates = append(rest_candidates, c)
+		}
+	}
+	if len(window_candidates) > 0 {
+		return window_candidates[rand.Intn(len(window_candidates))]
+	}
+	if len(rest_candidates) > 0 {
+		return rest_candidates[rand.Intn(len(rest_candidates))]
 	}
 	return nil
 }
