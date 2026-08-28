@@ -167,8 +167,10 @@ func (connection *Connection) bootstrap_chain() error {
 		}
 
 		total_keys := 0
+		step1_started := time.Now()
 
 		if state.Step < 2 {
+			connection.logger.Info("==================== BOOTSTRAP STEP 1 STARTED: fetching balance tree ====================", "estimated_keys", response.KeyCount, "chunks", chunks, "resuming_from_chunk", state.Chunk)
 
 			// Fan the chunk fetch itself across every eligible peer, not just
 			// the single quorum-chosen connection - reuses the same
@@ -393,6 +395,7 @@ func (connection *Connection) bootstrap_chain() error {
 					inflight_count++
 				}
 			}
+			connection.logger.Info("==================== BOOTSTRAP STEP 1 COMPLETED: balance tree fetched ====================", "total_keys", total_keys, "duration", time.Since(step1_started).Round(time.Second).String())
 			state.Step = 2
 			state.Chunk = 0
 		}
@@ -414,6 +417,8 @@ func (connection *Connection) bootstrap_chain() error {
 		}
 
 		total_keys := 0
+		step2_started := time.Now()
+		connection.logger.Info("==================== BOOTSTRAP STEP 2 STARTED: fetching SC-meta and per-SC data trees ====================", "estimated_keys", response.SCKeyCount, "chunks", chunks, "resuming_from_chunk", state.Chunk)
 
 		// Fan the SC-meta chunk fetch across eligible peers too - same
 		// pattern as the balance tree above. Recomputed fresh here rather
@@ -758,7 +763,7 @@ func (connection *Connection) bootstrap_chain() error {
 								active_peers = append(active_peers, addr)
 							}
 							current_sc_peers_mu.Unlock()
-							connection.logger.V(1).Info("bootstrap: step 2 still fetching SC data trees", "done", done, "total_this_chunk", len(ts_response.Keys), "in_flight", sc_inflight, "active_peers", active_peers)
+							connection.logger.Info("bootstrap: step 2 still fetching SC data trees", "done", done, "total_this_chunk", len(ts_response.Keys), "in_flight", sc_inflight, "active_peers", active_peers)
 							continue
 						}
 						done++
@@ -822,6 +827,7 @@ func (connection *Connection) bootstrap_chain() error {
 				inflight_count++
 			}
 		}
+		connection.logger.Info("==================== BOOTSTRAP STEP 2 COMPLETED: SC-meta and per-SC data trees fetched ====================", "total_keys", total_keys, "duration", time.Since(step2_started).Round(time.Second).String())
 	}
 
 	for i := int64(0); i <= request.TopoHeights[0]; i++ {
