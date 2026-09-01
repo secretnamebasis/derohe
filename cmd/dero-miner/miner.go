@@ -464,7 +464,11 @@ func mineblock(tid int) {
 
 	scratch := astrobwt_fast.Pool.Get().(*astrobwt_fast.ScratchData)
 
-	time.Sleep(5 * time.Second)
+	// Staggered by tid so threads pin and ramp to full boost one at a time
+	// instead of every core waking simultaneously -- a synchronized wake
+	// across many cores is a much sharper current spike than the same cores
+	// reaching full load a few milliseconds apart.
+	time.Sleep(5*time.Second + time.Duration(tid)*15*time.Millisecond)
 
 	nonce_buf := work[block.MINIBLOCK_SIZE-5:]   //since slices are linked, it modifies parent
 	nonce_bufB := workB[block.MINIBLOCK_SIZE-5:] //same relationship to workB
